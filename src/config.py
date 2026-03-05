@@ -1,9 +1,12 @@
 # config.py
 import os
+import json
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Dict, Optional, Any
 
 # Load environment variables from .env file
 load_dotenv()
@@ -116,3 +119,104 @@ else:
 
 logger.info(f"Read-only mode: {MCP_READ_ONLY}")
 logger.info(f"Logging to console and to file: {LOG_FILE_PATH} (Level: {LOG_LEVEL}, MaxSize: {LOG_MAX_BYTES}B, Backups: {LOG_BACKUP_COUNT})")
+
+
+# --- Multi-Instance Configuration ---
+INSTANCES_FILE_NAME = "instances.json"
+
+
+@dataclass
+class InstanceConfig:
+    """Configuration for a single database instance."""
+    host: str = "localhost"
+    port: int = 3306
+    user: str = ""
+    password: str = ""
+    db: str = ""
+    charset: Optional[str] = None
+    ssl: bool = False
+    ssl_ca: Optional[str] = None
+    ssl_cert: Optional[str] = None
+    ssl_key: Optional[str] = None
+    ssl_verify_cert: bool = True
+    ssl_verify_identity: bool = False
+
+
+def load_instances() -> Dict[str, Any]:
+    """
+    Load instance configurations.
+
+    Discovery order:
+    1. Look for instances.json in the project root (parent of src/).
+    2. If not found, fall back to single-instance mode using DB_* env vars.
+
+    Returns:
+        Dict with keys:
+        - "default_instance": str — name of the default instance
+        - "instances": Dict[str, InstanceConfig] — name → config mapping
+    """
+    # Project root = parent of src/ directory (where server.py lives)
+    project_root = Path(__file__).resolve().parent.parent
+    instances_file = project_root / INSTANCES_FILE_NAME
+
+    if instances_file.is_file():
+        logger.info(f"Loading multi-instance config from: {instances_file}")
+        try:
+            with open(instances_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to parse {instances_file}: {e}")
+            raise RuntimeError(f"Failed to load instances config: {e}") from e
+
+        raw_instances = data.get("instances", {})
+        if not raw_instances:
+            raise RuntimeError(f"No instances defined in {instances_file}")
+
+        default_name = data.get("default_instance")
+        if not default_name or default_name not in raw_instances:
+            # Fall back to the first key
+            default_name = next(iter(raw_instances))
+            logger.warning(f"default_instance not set or invalid, using: '{default_name}'")
+
+        instances: Dict[str, InstanceConfig] = {}
+        for name, cfg in raw_instances.items():
+            instances[name] = InstanceConfig(
+                host=cfg.get("host", "localhost"),
+                port=int(cfg.get("port", 3306)),
+                user=cfg.get("user", ""),
+                password=cfg.get("password", ""),
+                db=cfg.get("db", ""),
+                charset=cfg.get("charset"),
+                ssl=cfg.get("ssl", False),
+                ssl_ca=cfg.get("ssl_ca"),
+                ssl_cert=cfg.get("ssl_cert"),
+                ssl_key=cfg.get("ssl_key"),
+                ssl_verify_cert=cfg.get("ssl_verify_cert", True),
+                ssl_verify_identity=cfg.get("ssl_verify_identity", False),
+            )
+
+        logger.info(f"Loaded {len(instances)} instance(s): {list(instances.keys())} (default: '{default_name}')")
+        return {"default_instance": default_name, "instances": instances}
+
+    # Fallback: single-instance mode from env vars
+    logger.info("No instances.json found. Using single-instance mode from DB_* env vars.")
+    if not DB_USER:
+        logger.error("Single-instance mode requires DB_USER to be set.")
+    if DB_PASSWORD is None:
+        logger.error("Single-instance mode requires DB_PASSWORD to be set.")
+
+    default_cfg = InstanceConfig(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER or "",
+        password=DB_PASSWORD or "",
+        db=DB_NAME or "",
+        charset=DB_CHARSET,
+        ssl=DB_SSL,
+        ssl_ca=DB_SSL_CA,
+        ssl_cert=DB_SSL_CERT,
+        ssl_key=DB_SSL_KEY,
+        ssl_verify_cert=DB_SSL_VERIFY_CERT,
+        ssl_verify_identity=DB_SSL_VERIFY_IDENTITY,
+    )
+    return {"default_instance": "default", "instances": {"default": default_cfg}}

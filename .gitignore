@@ -7,5 +7,6 @@ src/logs/*
 *.pyo
 *.pyd
 .env
+instances.json
 uv.lock
 .DS_Store
