@@ -9,5 +9,3 @@ src/logs/*
 .env
 uv.lock
 .DS_Store
-.env
-.env
