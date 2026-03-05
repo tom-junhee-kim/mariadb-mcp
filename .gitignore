@@ -9,4 +9,5 @@ src/logs/*
 .env
 instances.json
 uv.lock
+*.egg-info/
 .DS_Store

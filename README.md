@@ -109,6 +109,7 @@ The MCP MariaDB Server provides **optional** embedding and vector store capabili
 
 - `EMBEDDING_PROVIDER`: Set to `openai`, `gemini`, `huggingface`, or leave unset to disable
 - `OPENAI_API_KEY`: Required if using OpenAI embeddings
+- `OPENAI_BASE_URL`: Custom base URL for OpenAI-compatible embedding servers (e.g., local inference)
 - `GEMINI_API_KEY`: Required if using Gemini embeddings
 - `HF_MODEL`: Required if using HuggingFace embeddings (e.g., "intfloat/multilingual-e5-large-instruct" or "BAAI/bge-m3")
 ### Model Selection
@@ -127,6 +128,42 @@ A vector store table has the following columns:
 ---
 
 ## Configuration & Environment Variables
+
+### Single-Instance Mode (default)
+
+Configuration is via environment variables (typically set in a `.env` file). See `.env.example` for a complete template.
+
+### Multi-Instance Mode
+
+To connect to multiple MariaDB servers, create an `instances.json` file in the project root (see `instances.example.json`):
+
+```json
+{
+  "default_instance": "local",
+  "instances": {
+    "local": {
+      "host": "localhost",
+      "port": 3306,
+      "user": "root",
+      "password": "",
+      "db": "mydb"
+    },
+    "production": {
+      "host": "db.example.com",
+      "port": 3306,
+      "user": "app_user",
+      "password": "secret",
+      "db": "production_db",
+      "ssl": true,
+      "ssl_verify_cert": true
+    }
+  }
+}
+```
+
+When `instances.json` is present, `DB_*` environment variables are ignored. Each tool call accepts an optional `instance_name` parameter to target a specific instance (defaults to `default_instance`).
+
+### Environment Variables
 
 All configuration is via environment variables (typically set in a `.env` file):
 
@@ -148,6 +185,7 @@ All configuration is via environment variables (typically set in a `.env` file):
 | `MCP_MAX_POOL_SIZE`    | Max DB connection pool size                            | No       | `10`         |
 | `EMBEDDING_PROVIDER`   | Embedding provider (`openai`/`gemini`/`huggingface`)   | No     |`None`(Disabled)|
 | `OPENAI_API_KEY`       | API key for OpenAI embeddings                          | Yes (if EMBEDDING_PROVIDER=openai) | |
+| `OPENAI_BASE_URL`      | Custom base URL for OpenAI-compatible embedding server | No       | OpenAI default |
 | `GEMINI_API_KEY`       | API key for Gemini embeddings                          | Yes (if EMBEDDING_PROVIDER=gemini) | |
 | `HF_MODEL`             | Open models from Huggingface                           | Yes (if EMBEDDING_PROVIDER=huggingface) | |
 | `ALLOWED_ORIGINS`      | Comma-separated list of allowed origins                | No       | Long list of allowed origins corresponding to local use of the server |
