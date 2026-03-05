@@ -7,6 +7,7 @@ import numpy as np
 
 # Import configuration variables and the logger instance
 from config import (
+    OPENAI_BASE_URL,
     EMBEDDING_PROVIDER,
     OPENAI_API_KEY,
     GEMINI_API_KEY,
@@ -93,7 +94,7 @@ class EmbeddingService:
                 logger.error("OpenAI API key is missing.")
                 raise ValueError("OpenAI API key is required for the OpenAI provider.")
             try:
-                self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+                self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
                 self.allowed_models = ALLOWED_OPENAI_MODELS
                 self.default_model = DEFAULT_OPENAI_MODEL
                 logger.info(f"OpenAI client initialized. Default model: {self.default_model}. Allowed: {self.allowed_models}")

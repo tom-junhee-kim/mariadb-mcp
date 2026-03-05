@@ -84,6 +84,7 @@ EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER")
 EMBEDDING_PROVIDER = EMBEDDING_PROVIDER.lower() if EMBEDDING_PROVIDER else None
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # Custom base URL for local embedding server
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Open models from Huggingface
 HF_MODEL = os.getenv("HF_MODEL")
