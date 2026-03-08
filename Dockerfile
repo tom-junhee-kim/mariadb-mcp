@@ -26,6 +26,9 @@ ENV PATH="/app/.venv/bin:${PATH}"
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 
+# Fix venv python symlink (builder's uv python path doesn't exist in final stage)
+RUN ln -sf /usr/local/bin/python3 /app/.venv/bin/python
+
 EXPOSE 9001
 
 CMD ["python", "src/server.py", "--host", "0.0.0.0", "--transport", "sse"]
