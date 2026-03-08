@@ -7,7 +7,8 @@ src/logs/*
 *.pyo
 *.pyd
 .env
-instances.json
+instances-*.json
+!instances-*.example.json
 uv.lock
 *.egg-info/
 .DS_Store

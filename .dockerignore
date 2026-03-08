@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+logs/
+*.pyc
+*.pyo
+.env
+.env.example
+instances*.json
+instances*.example.json
+deploy.*
+.git*
+README.md
+LICENSE
+docker-compose.yml
+src/tests/

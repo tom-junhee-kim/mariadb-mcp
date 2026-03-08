@@ -1,0 +1,19 @@
+{
+  "default_instance": "orangepi5plus",
+  "instances": {
+    "raspberrypi": {
+      "host": "192.168.2.12",
+      "port": 3306,
+      "user": "",
+      "password": "",
+      "db": "mysql"
+    },
+    "orangepi5plus": {
+      "host": "192.168.2.13",
+      "port": 3306,
+      "user": "",
+      "password": "",
+      "db": "mysql"
+    }
+  }
+}
