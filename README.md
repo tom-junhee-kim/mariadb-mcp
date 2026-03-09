@@ -33,8 +33,34 @@ The MCP MariaDB Server exposes a set of tools for interacting with MariaDB datab
 
 - **server.py**: Main MCP server logic and tool definitions.
 - **config.py**: Loads configuration from environment and `.env` files.
-- **embeddings.py**: Handles embedding service integration (OpenAI).
+- **custom_connection.py**: SafeConnection/SafePool — MULTI_STATEMENTS 비활성화 (SQL 인젝션 방지).
+- **embeddings.py**: Handles embedding service integration (OpenAI/Gemini/HuggingFace).
 - **tests/**: Manual and automated test documentation and scripts.
+
+## File Structure
+
+```
+mariadb-mcp/
+├── src/
+│   ├── server.py              # MCP 서버 메인
+│   ├── config.py              # 환경 변수 로딩 + 로깅
+│   ├── custom_connection.py   # SafeConnection/SafePool
+│   ├── embeddings.py          # 임베딩 서비스
+│   └── tests/                 # 테스트
+├── Dockerfile                 # 멀티 스테이지 빌드
+├── docker-compose.yml         # 로컬 개발용
+├── build.sh                   # 서버 이미지 빌드
+├── run.sh                     # 서버 컨테이너 실행 (3개 인스턴스 그룹)
+├── deploy.sh                  # macOS 배포 (rsync)
+├── deploy.ps1                 # Windows 배포 (scp)
+├── .env                       # 로컬 테스트용 환경 변수 (gitignored)
+├── .env.production            # 프로덕션 환경 변수 (gitignored, deploy가 서버 .env로 복사)
+├── .env.example               # 환경 변수 템플릿
+├── instances.example.json     # 멀티 인스턴스 설정 템플릿
+├── instances-*.json           # 실제 인스턴스 설정 (gitignored)
+├── pyproject.toml             # 프로젝트 메타데이터 (uv)
+└── .python-version            # Python 3.11.9
+```
 
 ---
 
@@ -128,6 +154,14 @@ A vector store table has the following columns:
 ---
 
 ## Configuration & Environment Variables
+
+### .env 파일 구조
+
+| 파일 | 용도 | git 추적 |
+|------|------|----------|
+| `.env` | 로컬 테스트용 (운영 도메인 경유) | No |
+| `.env.production` | 프로덕션 (내부 IP, deploy 스크립트가 서버 `.env`로 복사) | No |
+| `.env.example` | 템플릿 (비밀번호 미포함) | Yes |
 
 ### Single-Instance Mode (default)
 
@@ -445,6 +479,35 @@ export FASTMCP_SERVER_AUTH_GOOGLE_CLIENT_SECRET="GOCSPX-..."
 }
 
 ```
+
+---
+
+## Deployment
+
+### 배포 스크립트
+
+- **macOS**: `./deploy.sh` (rsync 기반)
+- **Windows**: `.\deploy.ps1` (scp 기반)
+
+배포 스크립트는 `.env.production`을 서버의 `.env`로 자동 복사합니다.
+
+### 서버 구성 (DM300S3B-B33)
+
+3개 컨테이너 그룹으로 운영:
+
+| 컨테이너 | 포트 | instances 파일 | 대상 DB |
+|----------|------|---------------|---------|
+| mariadb-mcp-main | 9001 | instances-9001.json | raspberrypi, orangepi5plus |
+| mariadb-mcp-bflow | 9002 | instances-9002.json | b-flow-*, bflow-shoplinker |
+| mariadb-mcp-RM8130N6Z64 | 9003 | instances-9003.json | RM8130N6Z64 |
+
+### 외부 접근 (Cloudflare Tunnel)
+
+| URL | 포트 |
+|-----|------|
+| `https://db.codescent.biz/codescent/sse` | 9001 |
+| `https://db.codescent.biz/brich/sse` | 9002 |
+| `https://db.codescent.biz/komid/sse` | 9003 |
 
 ---
 
