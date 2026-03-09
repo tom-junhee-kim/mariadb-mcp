@@ -77,6 +77,51 @@ class MariaDBServer:
         if self.is_read_only:
             logger.warning("Server running in READ-ONLY mode. Write operations are disabled.")
 
+    async def _warn_if_file_privilege_enabled(self, pool, name: str = "") -> None:
+        if pool is None:
+            return
+
+        try:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("SELECT CURRENT_USER()")
+                    current_user_row = await cursor.fetchone()
+                    if not current_user_row:
+                        return
+
+                    if isinstance(current_user_row, dict):
+                        current_user = next(iter(current_user_row.values()))
+                    else:
+                        current_user = current_user_row[0]
+
+                    if not current_user:
+                        return
+
+                    await cursor.execute(f"SHOW GRANTS FOR {current_user}")
+                    grant_rows = await cursor.fetchall()
+
+                    grants: List[str] = []
+                    for row in grant_rows or []:
+                        if isinstance(row, dict):
+                            grants.append(str(next(iter(row.values()))))
+                        else:
+                            grants.append(str(row[0]))
+
+                    has_file_priv = any(
+                        re.search(r"\bFILE\b", grant, flags=re.IGNORECASE) and "ON *.*" in grant.upper()
+                        for grant in grants
+                    )
+
+                    if has_file_priv:
+                        logger.error(
+                            f"Connected database user (instance '{name}') has the global FILE privilege. "
+                            "This means the server is NOT running in a fully read-only posture, because MariaDB/MySQL allow "
+                            "filesystem read/write via SQL (e.g. SELECT ... INTO OUTFILE, LOAD DATA INFILE, LOAD_FILE()). "
+                            "This cannot be fixed client-side; revoke FILE for the database user you are connecting as."
+                        )
+        except Exception as e:
+            logger.debug(f"Unable to determine whether FILE privilege is enabled: {e}")
+
     async def create_vector_store(self, database_name: str, vector_store_name: str, model_name: Optional[str] = None, distance_function: Optional[str] = None, instance_name: Optional[str] = None) -> dict:
         """
         This tool creates a table which stores embeddings.
@@ -181,6 +226,8 @@ class MariaDBServer:
         logger.info(f"Creating pool for instance '{name}': {cfg.user}@{cfg.host}:{cfg.port}/{cfg.db}")
         pool = await create_safe_pool(**pool_params)
         logger.info(f"Pool for instance '{name}' initialized successfully.")
+        if self.is_read_only:
+            await self._warn_if_file_privilege_enabled(pool, name)
         return pool
 
     def _record_failure(self, name: str, error: Exception) -> None:
@@ -295,7 +342,10 @@ class MariaDBServer:
                         logger.info(f"Switching database context from '{actual_current_db}' to '{database}'")
                         await cursor.execute(f"USE `{database}`")
 
-                    await cursor.execute(sql, params)
+                    if params is None:
+                        await cursor.execute(sql)
+                    else:
+                        await cursor.execute(sql, params)
                     results = await cursor.fetchall()
                     logger.info(f"Query executed successfully, {len(results)} rows returned.")
                     return results if results else []
