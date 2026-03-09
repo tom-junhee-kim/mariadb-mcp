@@ -1,4 +1,5 @@
 # Windows용 배포 스크립트 (scp 기반, rsync 없는 환경)
+# - .env.production → 서버의 .env로 복사
 # - 로컬 mariadb-mcp/ 파일을 서버로 업로드 후 이미지 빌드 & 컨테이너 재시작
 # - 사용법: .\deploy.ps1
 $ErrorActionPreference = "Stop"
@@ -7,8 +8,7 @@ $Host_ = "DM300S3B-B33-jhcheong"
 $RemoteDir = "~/mariadb-mcp"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # 배포 대상 파일 목록
-# .env, instances-*.json은 서버에서 직접 관리 (비밀번호 포함)
-$Files = @(".gitattributes", "Dockerfile", ".dockerignore", "build.sh", "run.sh", "pyproject.toml", ".python-version", "uv.lock")
+$Files = @("Dockerfile", ".dockerignore", "build.sh", "run.sh", "pyproject.toml", ".python-version")
 # 배포 대상 디렉토리 목록
 $Dirs = @("src")
 # 제외할 src 하위 디렉토리
@@ -18,9 +18,10 @@ $ExcludeSrcDirs = @("tests")
 Write-Host "==> Stopping old containers"
 $OldContainers = @(
     "mariadb-mcp-raspberrypi", "mariadb-mcp-orangepi5plus",
-    "mariadb-mcp-RM8130N6Z64", "mariadb-mcp-b-flow-new-temp",
-    "mariadb-mcp-b-flow-standalone", "mariadb-mcp-b-flow-middleware-auth",
-    "mariadb-mcp-b-flow-push", "mariadb-mcp-bflow-shoplinker"
+    "mariadb-mcp-RM8130N6Z64", "mariadb-mcp-rm8130n6z64",
+    "mariadb-mcp-b-flow-new-temp", "mariadb-mcp-b-flow-standalone",
+    "mariadb-mcp-b-flow-middleware-auth", "mariadb-mcp-b-flow-push",
+    "mariadb-mcp-bflow-shoplinker"
 )
 $OldContainersStr = $OldContainers -join " "
 ssh $Host_ "for c in $OldContainersStr; do docker stop `$c 2>/dev/null; docker rm `$c 2>/dev/null; done"
@@ -65,13 +66,23 @@ foreach ($d in $Dirs) {
     }
 }
 
-# Windows에서 scp한 파일은 CRLF 줄바꿈 → LF로 변환
-Write-Host "==> Converting CRLF to LF on remote"
-ssh $Host_ "cd $RemoteDir && find . -name '*.sh' -o -name '*.py' -o -name 'Dockerfile' -o -name '.dockerignore' | xargs -r sed -i 's/\r$//'"
+# .env.production → 서버의 .env로 복사
+Write-Host "==> Deploying .env.production as .env"
+$envProd = Join-Path $ScriptDir ".env.production"
+if (Test-Path $envProd) {
+    scp $envProd "${Host_}:${RemoteDir}/.env"
+} else {
+    Write-Error ".env.production not found. Create it from .env.example first."
+    exit 1
+}
 
-# 배포 대상 외 잔여 파일 정리 — 보존: .env, instances-*.json, .gitattributes, Dockerfile, .dockerignore, *.sh, src/, pyproject.toml, .python-version, uv.lock, logs/
+# Windows에서 scp한 파일은 CRLF 줄바꿈 → LF로 변환 (scp는 git이 아니므로 .gitattributes 미적용)
+Write-Host "==> Converting CRLF to LF on remote"
+ssh $Host_ "cd $RemoteDir && find . -name '*.sh' -o -name '*.py' -o -name 'Dockerfile' -o -name '.dockerignore' -o -name '.env' | xargs -r sed -i 's/\r$//'"
+
+# 배포 대상 외 잔여 파일 정리 — 보존: .env, instances-*.json, Dockerfile, .dockerignore, *.sh, src/, pyproject.toml, .python-version
 Write-Host "==> Cleaning up old files on remote"
-ssh $Host_ "cd $RemoteDir && ls -A | grep -v -E '^(\.env|instances-.*\.json|\.gitattributes|Dockerfile|\.dockerignore|build\.sh|run\.sh|src|pyproject\.toml|\.python-version|uv\.lock|logs)$' | xargs -r rm -rf"
+ssh $Host_ "cd $RemoteDir && ls -A | grep -v -E '^(\.env|instances-.*\.json|Dockerfile|\.dockerignore|build\.sh|run\.sh|src|pyproject\.toml|\.python-version)$' | xargs -r rm -rf"
 
 # 이미지 빌드
 Write-Host "==> Building Docker image on remote"
