@@ -5,10 +5,11 @@ logs/
 *.pyo
 .env
 .env.example
+.env.production
 instances*.json
-instances*.example.json
 deploy.*
 .git*
+.gitattributes
 README.md
 LICENSE
 docker-compose.yml

@@ -1,14 +1,19 @@
-# .gitignore
+# Python
 .venv/
 __pycache__/
-logs/*
-src/logs/*
 *.pyc
 *.pyo
 *.pyd
-.env
-instances-*.json
-!instances-*.example.json
-uv.lock
 *.egg-info/
+
+# Runtime
+logs/
+
+# OS
 .DS_Store
+
+# API 키/비밀번호가 포함된 파일 (커밋 금지)
+.env
+.env.production
+instances-*.json
+uv.lock
