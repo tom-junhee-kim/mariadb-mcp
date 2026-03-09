@@ -82,7 +82,7 @@ ssh $Host_ "cd $RemoteDir && find . -name '*.sh' -o -name '*.py' -o -name 'Docke
 
 # 배포 대상 외 잔여 파일 정리 — 보존: .env, instances-*.json, Dockerfile, .dockerignore, *.sh, src/, pyproject.toml, .python-version
 Write-Host "==> Cleaning up old files on remote"
-ssh $Host_ "cd $RemoteDir && ls -A | grep -v -E '^(\.env|instances-.*\.json|Dockerfile|\.dockerignore|build\.sh|run\.sh|src|pyproject\.toml|\.python-version)$' | xargs -r rm -rf"
+ssh $Host_ "cd $RemoteDir && ls -A | grep -v -E '^(\.env|instances-.*\.json|Dockerfile|\.dockerignore|build\.sh|run\.sh|src|pyproject\.toml|\.python-version|logs)$' | xargs -r rm -rf"
 
 # 이미지 빌드
 Write-Host "==> Building Docker image on remote"

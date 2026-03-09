@@ -12,6 +12,9 @@
 
 DIR=~/mariadb-mcp
 
+# logs 디렉토리 생성 (없으면)
+mkdir -p "$DIR/logs"
+
 for entry in "mariadb-mcp-main:9001:instances-9001.json" \
              "mariadb-mcp-bflow:9002:instances-9002.json" \
              "mariadb-mcp-RM8130N6Z64:9003:instances-9003.json"; do
@@ -21,7 +24,9 @@ for entry in "mariadb-mcp-main:9001:instances-9001.json" \
     -h "$name" \
     --restart always \
     --env-file "$DIR/.env" \
+    -e "LOG_FILE=logs/${name}.log" \
     -v "$DIR/$instances:/app/instances.json:ro" \
+    -v "$DIR/logs:/app/logs" \
     -p "$port:9001" \
     codescent/mariadb-mcp:latest
 done
