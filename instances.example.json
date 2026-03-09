@@ -1,0 +1,26 @@
+{
+  "default_instance": "example-db-1",
+  "instances": {
+    "example-db-1": {
+      "host": "192.168.x.x",
+      "port": 3306,
+      "user": "",
+      "password": "",
+      "db": "mysql"
+    },
+    "example-db-2": {
+      "host": "192.168.x.x",
+      "port": 3306,
+      "user": "",
+      "password": "",
+      "db": "mysql"
+    },
+    "example-db-3": {
+      "host": "192.168.x.x",
+      "port": 3306,
+      "user": "",
+      "password": "",
+      "db": "mysql"
+    }
+  }
+}
