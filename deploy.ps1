@@ -18,7 +18,7 @@ $ExcludeSrcDirs = @("tests")
 Write-Host "==> Stopping old containers"
 $OldContainers = @(
     "mariadb-mcp-raspberrypi", "mariadb-mcp-orangepi5plus",
-    "mariadb-mcp-rm8130n6z64", "mariadb-mcp-b-flow-new-temp",
+    "mariadb-mcp-RM8130N6Z64", "mariadb-mcp-b-flow-new-temp",
     "mariadb-mcp-b-flow-standalone", "mariadb-mcp-b-flow-middleware-auth",
     "mariadb-mcp-b-flow-push", "mariadb-mcp-bflow-shoplinker"
 )
@@ -27,7 +27,7 @@ ssh $Host_ "for c in $OldContainersStr; do docker stop `$c 2>/dev/null; docker r
 
 # 새 컨테이너 정리
 Write-Host "==> Stopping current containers"
-ssh $Host_ "for c in mariadb-mcp-main mariadb-mcp-bflow mariadb-mcp-rm8130n6z64; do docker stop `$c 2>/dev/null; docker rm `$c 2>/dev/null; done"
+ssh $Host_ "for c in mariadb-mcp-main mariadb-mcp-bflow mariadb-mcp-RM8130N6Z64 mariadb-mcp-rm8130n6z64; do docker stop `$c 2>/dev/null; docker rm `$c 2>/dev/null; done"
 
 # 파일 업로드
 Write-Host "==> Uploading files to ${Host_}:${RemoteDir}"

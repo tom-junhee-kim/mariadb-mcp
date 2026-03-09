@@ -8,13 +8,13 @@
 # 포트 매핑:
 #   9001: raspberrypi + orangepi5plus (기본)
 #   9002: b-flow-* + bflow-*
-#   9003: rm8130n6z64
+#   9003: RM8130N6Z64
 
 DIR=~/mariadb-mcp
 
 for entry in "mariadb-mcp-main:9001:instances-9001.json" \
              "mariadb-mcp-bflow:9002:instances-9002.json" \
-             "mariadb-mcp-rm8130n6z64:9003:instances-9003.json"; do
+             "mariadb-mcp-RM8130N6Z64:9003:instances-9003.json"; do
   IFS=: read -r name port instances <<< "$entry"
   docker run -d \
     --name "$name" \

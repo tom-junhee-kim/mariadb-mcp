@@ -10,11 +10,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # 기존 8개 컨테이너 정리 (최초 배포 시에만 필요, 이후에는 무해)
 echo "==> Stopping old containers"
-ssh "$HOST" 'for c in mariadb-mcp-raspberrypi mariadb-mcp-orangepi5plus mariadb-mcp-rm8130n6z64 mariadb-mcp-b-flow-new-temp mariadb-mcp-b-flow-standalone mariadb-mcp-b-flow-middleware-auth mariadb-mcp-b-flow-push mariadb-mcp-bflow-shoplinker; do docker stop $c 2>/dev/null; docker rm $c 2>/dev/null; done || true'
+ssh "$HOST" 'for c in mariadb-mcp-raspberrypi mariadb-mcp-orangepi5plus mariadb-mcp-RM8130N6Z64 mariadb-mcp-b-flow-new-temp mariadb-mcp-b-flow-standalone mariadb-mcp-b-flow-middleware-auth mariadb-mcp-b-flow-push mariadb-mcp-bflow-shoplinker; do docker stop $c 2>/dev/null; docker rm $c 2>/dev/null; done || true'
 
 # 새 컨테이너 정리
 echo "==> Stopping current containers"
-ssh "$HOST" 'for c in mariadb-mcp-main mariadb-mcp-bflow mariadb-mcp-rm8130n6z64; do docker stop $c 2>/dev/null; docker rm $c 2>/dev/null; done || true'
+ssh "$HOST" 'for c in mariadb-mcp-main mariadb-mcp-bflow mariadb-mcp-RM8130N6Z64 mariadb-mcp-rm8130n6z64; do docker stop $c 2>/dev/null; docker rm $c 2>/dev/null; done || true'
 
 # 파일 동기화
 # .env, instances-*.json, deploy 스크립트, .gitignore, *.example.*, README.md, docker-compose.yml, .venv/, tests/ 제외
