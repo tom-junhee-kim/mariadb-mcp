@@ -13,8 +13,8 @@ logs/*
 # OS
 .DS_Store
 
-# API 키/비밀번호가 포함된 파일 (커밋 금지)
-.env
-.env.production
+# 환경 변수 파일 (커밋 금지)
+.env*
+!.env.example
 instances-*.json
 uv.lock
