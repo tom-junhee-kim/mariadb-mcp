@@ -1,5 +1,37 @@
-# 기본: LF (macOS/Linux)
+# 기본: LF (Linux 컨테이너 호환)
 * text=auto eol=lf
 
-# PowerShell: CRLF (Windows)
+# 셸 스크립트
+*.sh text eol=lf
+
+# Docker
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+
+# 설정 파일
+*.conf text eol=lf
+*.cnf text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.properties text eol=lf
+*.sql text eol=lf
+
+# 소스 코드
+*.py text eol=lf
+*.js text eol=lf
+
+# Windows
 *.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 바이너리
+*.p12 binary
+*.db binary
+*.png binary
+*.jpg binary
+*.tar binary
+*.gz binary
