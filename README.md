@@ -68,6 +68,11 @@ mariadb-mcp/
 | `https://db.codescent.biz/brich/sse` | 9001 | b-flow-*, bflow-shoplinker |
 | `https://db.codescent.biz/komid/sse` | 9001 | RM8130N6Z64 |
 
+## 버전 관리
+
+- Public fork 저장소 — 태그/릴리즈는 upstream(MariaDB/mcp)에서 관리
+- codescent 브랜치의 독립 릴리즈 생성 금지
+
 ## 배포
 
 ```bash
