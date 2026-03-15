@@ -18,6 +18,8 @@ COPY . .
 RUN uv sync --no-dev
 
 FROM python:3.11-slim
+LABEL maintainer="codescent" \
+      project="mariadb-mcp"
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:${PATH}"

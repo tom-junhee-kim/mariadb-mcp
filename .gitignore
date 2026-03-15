@@ -16,5 +16,16 @@ uv.lock
 logs/*
 !logs/.gitkeep
 
-# OS
+# OS 시스템 생성 파일 (GitHub 공식 gitignore 템플릿 기반)
+# macOS
 .DS_Store
+._*
+.AppleDouble
+.LSOverride
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+[Dd]esktop.ini
+# Linux
+*~
+.directory

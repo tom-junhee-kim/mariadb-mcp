@@ -1,16 +1,32 @@
-.venv/
-__pycache__/
-logs/
-*.pyc
-*.pyo
-.env
-.env.example
-.env.production
-instances*.json
-deploy.*
-.git*
+# 버전 관리
+.git
+.gitignore
 .gitattributes
+
+# 환경/배포
+.env*
+!.env.example
+deploy.*
+
+# 문서
 README.md
 LICENSE
+
+# OS 시스템 파일
+.DS_Store
+._*
+Thumbs.db
+[Dd]esktop.ini
+*~
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 프로젝트
+logs/
+tests/
+test_*.py
+instances.json
 docker-compose.yml
-src/tests/
