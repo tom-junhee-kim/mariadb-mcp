@@ -40,6 +40,7 @@ rsync -av --delete \
 echo "==> Deploying .env.production as .env"
 if [ -f "$SCRIPT_DIR/.env.production" ]; then
     scp "$SCRIPT_DIR/.env.production" "$HOST:$REMOTE_DIR/.env"
+    ssh "$HOST" "chmod 600 $REMOTE_DIR/.env"
 else
     echo "ERROR: .env.production not found. Create it from .env.example first." >&2
     exit 1
