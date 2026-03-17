@@ -81,6 +81,10 @@ Write-Host "==> Deploying .env.production as .env"
 scp ".env.production" "${Host_}:${RemoteDir}/.env"
 ssh $Host_ "cd $RemoteDir && sed -i 's/\r$//' .env && chmod 600 .env"
 
+# 로그 디렉토리 생성
+Write-Host "==> Ensuring logs directory"
+ssh $Host_ "mkdir -p $RemoteDir/logs && chmod 755 $RemoteDir/logs"
+
 # 이미지 빌드
 Write-Host "==> Building mariadb-mcp image"
 ssh $Host_ "bash $RemoteDir/build.sh"

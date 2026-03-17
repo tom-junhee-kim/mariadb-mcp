@@ -43,7 +43,7 @@ ssh "$HOST" "chmod 600 $REMOTE_DIR/.env"
 
 # 로그 디렉토리 생성
 echo "==> Ensuring logs directory"
-ssh "$HOST" "mkdir -p $REMOTE_DIR/logs"
+ssh "$HOST" "mkdir -p $REMOTE_DIR/logs && chmod 755 $REMOTE_DIR/logs"
 
 # 이미지 빌드
 echo "==> Building mariadb-mcp image"
