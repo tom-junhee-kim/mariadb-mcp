@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-$Host_ = "DM300S3B-B33-jhcheong"
+$Host_ = "DM300S3B-B33"
 $RemoteDir = "~/mariadb-mcp"
 
 # .env.production 확인
@@ -31,7 +31,7 @@ ssh $Host_ "for c in $OldContainersStr; do docker stop `$c 2>/dev/null; docker r
 # --- 파일 동기화 (deploy.sh rsync --delete 대체) ---
 # 제외 대상 (deploy.sh --exclude와 동일)
 $ExcludeNames = @('deploy.sh', 'deploy.ps1', '.gitignore', '.gitattributes', 'README.md', 'LICENSE', 'docker-compose.yml')
-$ExcludePatterns = @('.env*', '.git*', 'instances-*.json', '*.example.json')
+$ExcludePatterns = @('.env*', '.git*', '*.example.json')
 $ExcludeDirs = @('.git', '.venv', '__pycache__', 'logs')
 
 # 임시 디렉토리에 배포 대상만 복사
@@ -82,6 +82,9 @@ Remove-Item -Recurse -Force $TempDir
 # CRLF→LF 변환
 Write-Host "==> Converting CRLF to LF on remote"
 ssh $Host_ "cd $RemoteDir && find . -type f \( -name '*.sh' -o -name '*.py' -o -name '*.conf' -o -name '*.cnf' -o -name '*.cf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.toml' -o -name '*.json' -o -name '*.ini' -o -name '*.sql' -o -name '*.pem' -o -name 'Dockerfile' -o -name '.dockerignore' \) -exec sed -i 's/\r$//' {} +"
+
+# 스크립트 실행 권한 복원 (scp는 권한 미보존)
+ssh $Host_ "cd $RemoteDir && find . -name '*.sh' -exec chmod +x {} +"
 
 # .env.production → .env
 Write-Host "==> Deploying .env.production as .env"
