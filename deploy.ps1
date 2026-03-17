@@ -14,23 +14,13 @@ if (-not (Test-Path ".env.production")) {
     exit 1
 }
 
-# 기존 컨테이너 정리 (레거시 + 이전 3대 구성 + 현재 단일)
-Write-Host "==> Stopping old containers"
-$OldContainers = @(
-    "mariadb-mcp-raspberrypi", "mariadb-mcp-orangepi5plus",
-    "mariadb-mcp-RM8130N6Z64", "mariadb-mcp-rm8130n6z64",
-    "mariadb-mcp-b-flow-new-temp", "mariadb-mcp-b-flow-standalone",
-    "mariadb-mcp-b-flow-middleware-auth", "mariadb-mcp-b-flow-push",
-    "mariadb-mcp-bflow-shoplinker",
-    "mariadb-mcp-main", "mariadb-mcp-bflow",
-    "mariadb-mcp"
-)
-$OldContainersStr = $OldContainers -join " "
-ssh $Host_ "for c in $OldContainersStr; do docker stop `$c 2>/dev/null; docker rm `$c 2>/dev/null; done || true"
+# 컨테이너 중지 (배포 중 설정 불일치 방지)
+Write-Host "==> Stopping mariadb-mcp container"
+ssh $Host_ "docker stop mariadb-mcp 2>/dev/null || true"
 
 # --- 파일 동기화 (deploy.sh rsync --delete 대체) ---
 # 제외 대상 (deploy.sh --exclude와 동일)
-$ExcludeNames = @('deploy.sh', 'deploy.ps1', '.gitignore', '.gitattributes', 'README.md', 'LICENSE', 'docker-compose.yml')
+$ExcludeNames = @('deploy.sh', 'deploy.ps1', 'README.md', 'LICENSE', 'docker-compose.yml')
 $ExcludePatterns = @('.env*', '.git*', '*.example.json')
 $ExcludeDirs = @('.git', '.venv', '__pycache__', 'logs')
 
@@ -89,16 +79,15 @@ ssh $Host_ "cd $RemoteDir && find . -name '*.sh' -exec chmod +x {} +"
 # .env.production → .env
 Write-Host "==> Deploying .env.production as .env"
 scp ".env.production" "${Host_}:${RemoteDir}/.env"
-ssh $Host_ "sed -i 's/\r$//' $RemoteDir/.env"
-ssh $Host_ "chmod 600 $RemoteDir/.env"
+ssh $Host_ "cd $RemoteDir && sed -i 's/\r$//' .env && chmod 600 .env"
 
 # 이미지 빌드
-Write-Host "==> Building Docker image on remote"
-ssh $Host_ "cd $RemoteDir && bash build.sh"
+Write-Host "==> Building mariadb-mcp image"
+ssh $Host_ "bash $RemoteDir/build.sh"
 
-# 컨테이너 시작
-Write-Host "==> Starting mariadb-mcp container"
-ssh $Host_ "bash $RemoteDir/run.sh"
+# 컨테이너 재시작
+Write-Host "==> Restarting mariadb-mcp container"
+ssh $Host_ "docker rm mariadb-mcp 2>/dev/null; bash $RemoteDir/run.sh"
 
 # 기동 확인
 Write-Host "==> Waiting for startup..."
