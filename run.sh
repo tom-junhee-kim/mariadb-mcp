@@ -1,32 +1,22 @@
 #!/bin/bash
-# mariadb-mcp 컨테이너 실행 (3개 인스턴스 그룹)
+# mariadb-mcp 컨테이너 실행
 # - 서버(DM300S3B-B33)의 ~/mariadb-mcp/ 에서 실행
-# - instances-*.json을 볼륨 마운트로 주입 (컨테이너 내부 /app/instances.json)
-# - 컨테이너 내부 포트는 항상 9001, 호스트 포트만 다름
+# - instances.json으로 멀티 인스턴스 관리 (단일 컨테이너)
 # - deploy.sh 또는 deploy.ps1이 이 스크립트를 원격 호출함
-#
-# 포트 매핑:
-#   9001: raspberrypi + orangepi5plus (기본)
-#   9002: b-flow-* + bflow-*
-#   9003: RM8130N6Z64
-
-DIR=~/mariadb-mcp
-
-# logs 디렉토리 생성 (없으면)
-mkdir -p "$DIR/logs"
-
-for entry in "mariadb-mcp-main:9001:instances-9001.json" \
-             "mariadb-mcp-bflow:9002:instances-9002.json" \
-             "mariadb-mcp-RM8130N6Z64:9003:instances-9003.json"; do
-  IFS=: read -r name port instances <<< "$entry"
-  docker run -d \
-    --name "$name" \
-    -h "$name" \
-    --restart always \
-    --env-file "$DIR/.env" \
-    -e "LOG_FILE=logs/${name}.log" \
-    -v "$DIR/$instances:/app/instances.json:ro" \
-    -v "$DIR/logs:/app/logs" \
-    -p "$port:9001" \
-    codescent/mariadb-mcp:latest
-done
+docker run -d \
+  --name mariadb-mcp \
+  -h mariadb-mcp \
+  --restart unless-stopped \
+  --add-host=host.docker.internal:host-gateway \
+  --env-file ~/mariadb-mcp/.env \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  -v ~/mariadb-mcp/instances.json:/app/instances.json:ro \
+  -v ~/mariadb-mcp/logs:/app/logs \
+  -p 9001:9001 \
+  --health-cmd='bash -c "echo > /dev/tcp/localhost/9001" || exit 1' \
+  --health-interval=30s \
+  --health-timeout=10s \
+  --health-retries=3 \
+  --health-start-period=15s \
+  codescent/mariadb-mcp:latest

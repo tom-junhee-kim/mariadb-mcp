@@ -13,8 +13,7 @@ __pycache__/
 uv.lock
 
 # 로그 (런타임 생성, 서버에만 존재)
-logs/*
-!logs/.gitkeep
+logs/
 
 # OS 시스템 생성 파일 (GitHub 공식 gitignore 템플릿 기반)
 # macOS

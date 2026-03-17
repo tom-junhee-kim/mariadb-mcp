@@ -1,32 +1,13 @@
-# 버전 관리
-.git
-.gitignore
-.gitattributes
-
-# 환경/배포
+# 빌드 컨텍스트 제외 — builder의 COPY . .에서 pyproject.toml, src/, .python-version 필요
 .env*
-!.env.example
+.git*
 deploy.*
-
-# 문서
+build.sh
+run.sh
 README.md
 LICENSE
-
-# OS 시스템 파일
-.DS_Store
-._*
-Thumbs.db
-[Dd]esktop.ini
-*~
-
-# Python
-.venv/
-__pycache__/
-*.pyc
-
-# 프로젝트
-logs/
-tests/
-test_*.py
-instances.json
+instances*.json
 docker-compose.yml
+logs/
+__pycache__/
+.venv/
