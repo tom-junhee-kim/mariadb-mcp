@@ -51,6 +51,21 @@ async def safe_connect(**kwargs) -> SafeConnection:
     return conn
 
 
+def _connection_stream_broken(conn) -> bool:
+    """
+    Check whether a pooled connection's underlying stream is no longer usable.
+
+    asyncmy has changed how it exposes this across versions: newer releases
+    expose a `_stream_broken` property, while older releases (and the pinned
+    minimum, asyncmy>=0.2.10) only expose the raw `_reader` StreamReader.
+    Support both so the pool doesn't break on either side of that change.
+    """
+    if hasattr(conn, "_stream_broken"):
+        return bool(conn._stream_broken)
+    reader = getattr(conn, "_reader", None)
+    return reader is not None and (reader.at_eof() or reader.exception())
+
+
 class SafePool(Pool):
     """
     A Pool subclass that uses SafeConnection instead of Connection.
@@ -70,7 +85,7 @@ class SafePool(Pool):
         n = 0
         while n < free_size:
             conn = self._free[-1]
-            if conn._stream_broken:
+            if _connection_stream_broken(conn):
                 self._free.pop()
                 conn.close()
             elif self._recycle > -1 and self._loop.time() - conn.last_usage > self._recycle:

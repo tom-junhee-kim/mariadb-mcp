@@ -81,6 +81,15 @@ DB_SSL_VERIFY_IDENTITY = os.getenv("DB_SSL_VERIFY_IDENTITY", "false").lower() ==
 MCP_READ_ONLY = os.getenv("MCP_READ_ONLY", "true").lower() == "true"
 MCP_MAX_POOL_SIZE = int(os.getenv("MCP_MAX_POOL_SIZE", 10))
 
+# Block sensitive SHOW commands (e.g. SHOW PROCESSLIST, SHOW GRANTS,
+# SHOW VARIABLES, SHOW MASTER/REPLICA STATUS, SHOW BINARY LOGS) that can leak
+# cross-connection query text, credentials/privileges, or replication
+# topology. This is independent of MCP_READ_ONLY: some deployments want
+# these blocked even in write mode, others explicitly want them available
+# in read-only mode (e.g. trusted single-tenant admin usage). Defaults to
+# blocking, which is the safer default.
+MCP_BLOCK_SENSITIVE_SHOW = os.getenv("MCP_BLOCK_SENSITIVE_SHOW", "true").lower() == "true"
+
 # --- Embedding Configuration ---
 # Provider selection ('openai' or 'gemini' or 'huggingface')
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER")
@@ -118,6 +127,7 @@ else:
     logger.info(f"No EMBEDDING_PROVIDER selected or it is set to None. Disabling embedding features.")
 
 logger.info(f"Read-only mode: {MCP_READ_ONLY}")
+logger.info(f"Block sensitive SHOW commands: {MCP_BLOCK_SENSITIVE_SHOW}")
 logger.info(f"Logging to console and to file: {LOG_FILE_PATH} (Level: {LOG_LEVEL}, MaxSize: {LOG_MAX_BYTES}B, Backups: {LOG_BACKUP_COUNT})")
 
 

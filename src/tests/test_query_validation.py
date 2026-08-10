@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from server import MariaDBServer
-from custom_connection import SafeConnection
+from custom_connection import SafeConnection, SafePool, _connection_stream_broken
 from asyncmy.connection import Connection
 from asyncmy.constants.CLIENT import MULTI_STATEMENTS, LOCAL_FILES
 
@@ -28,6 +28,8 @@ class TestQueryValidation(unittest.TestCase):
         self.server = MariaDBServer(server_name="TestServer")
         # Force read-only mode to enable validation
         self.server.is_read_only = True
+        # Force sensitive-SHOW blocking on regardless of the environment
+        self.server.block_sensitive_show = True
         
         acquire_cm = MagicMock()
         acquire_cm.__aenter__ = AsyncMock(side_effect=RuntimeError("Database access not configured for unit tests"))
@@ -60,7 +62,7 @@ class TestQueryValidation(unittest.TestCase):
         try:
             await self.server._execute_query(query)
         except PermissionError as e:
-            if "LOAD_FILE" in str(e) or "INTO OUTFILE" in str(e) or "INTO DUMPFILE" in str(e):
+            if "LOAD_FILE" in str(e) or "INTO OUTFILE" in str(e) or "INTO DUMPFILE" in str(e) or "SHOW" in str(e):
                 self.fail(f"Query was incorrectly blocked by validation: {query}")
         except Exception:
             # Other exceptions (like syntax errors) are fine - we're only testing validation
@@ -258,6 +260,99 @@ class TestQueryValidation(unittest.TestCase):
             self._test_query_allowed(query)
         )
 
+    # SHOW namespace tests: SHOW is allowed in read-only mode, but some
+    # subcommands leak cross-connection or system-sensitive data and must
+    # still be blocked.
+
+    def test_show_processlist_is_blocked(self):
+        """SHOW PROCESSLIST exposes query text from other sessions; must be blocked."""
+        query = "SHOW PROCESSLIST"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "MCP_BLOCK_SENSITIVE_SHOW")
+        )
+
+    def test_show_grants_is_blocked(self):
+        """SHOW GRANTS enumerates privileges of a DB account; must be blocked."""
+        query = "SHOW GRANTS FOR 'root'@'%'"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "MCP_BLOCK_SENSITIVE_SHOW")
+        )
+
+    def test_show_variables_is_blocked(self):
+        """SHOW VARIABLES exposes server configuration/filesystem paths; must be blocked."""
+        queries = [
+            "SHOW VARIABLES",
+            "SHOW GLOBAL VARIABLES",
+            "SHOW SESSION VARIABLES LIKE 'version%'",
+        ]
+        for query in queries:
+            with self.subTest(query=query):
+                self.loop.run_until_complete(
+                    self._test_query_blocked(query, "MCP_BLOCK_SENSITIVE_SHOW")
+                )
+
+    def test_show_master_and_replica_status_is_blocked(self):
+        """SHOW MASTER/REPLICA STATUS exposes replication topology; must be blocked."""
+        queries = [
+            "SHOW MASTER STATUS",
+            "SHOW SLAVE STATUS",
+            "SHOW REPLICA STATUS",
+            "SHOW BINARY LOGS",
+        ]
+        for query in queries:
+            with self.subTest(query=query):
+                self.loop.run_until_complete(
+                    self._test_query_blocked(query, "MCP_BLOCK_SENSITIVE_SHOW")
+                )
+
+    def test_safe_show_variants_still_allowed(self):
+        """Ordinary schema-inspection SHOW commands remain unaffected."""
+        queries = [
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM users",
+            "SHOW CREATE TABLE users",
+            "SHOW DATABASES",
+            "SHOW INDEX FROM users",
+        ]
+        for query in queries:
+            with self.subTest(query=query):
+                self.loop.run_until_complete(
+                    self._test_query_allowed(query)
+                )
+
+    def test_show_blocking_is_independent_of_read_only(self):
+        """MCP_BLOCK_SENSITIVE_SHOW must apply even when the server is NOT
+        in read-only mode (a write-mode deployment may still want it blocked)."""
+        self.server.is_read_only = False
+        self.server.block_sensitive_show = True
+        query = "SHOW PROCESSLIST"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "MCP_BLOCK_SENSITIVE_SHOW")
+        )
+
+    def test_show_blocking_can_be_disabled_in_read_only_mode(self):
+        """When MCP_BLOCK_SENSITIVE_SHOW=false, sensitive SHOW commands must
+        be permitted even while the server is in read-only mode."""
+        self.server.is_read_only = True
+        self.server.block_sensitive_show = False
+        query = "SHOW PROCESSLIST"
+        self.loop.run_until_complete(
+            self._test_query_allowed(query)
+        )
+
+
+class TestAutocommit(unittest.TestCase):
+    """Test that autocommit respects the constructor parameter (issue: stale
+    reads in read-only mode caused by an unconditional autocommit override)."""
+
+    def test_autocommit_defaults_true_regardless_of_read_only(self):
+        server = MariaDBServer(server_name="TestServer")
+        self.assertTrue(server.autocommit)
+
+    def test_autocommit_respects_explicit_false(self):
+        server = MariaDBServer(server_name="TestServer", autocommit=False)
+        self.assertFalse(server.autocommit)
+
 
 class TestClientCapabilityAndPrivilegeWarnings(unittest.IsolatedAsyncioTestCase):
     async def test_safe_connection_clears_local_files_when_read_only(self):
@@ -333,6 +428,90 @@ class TestClientCapabilityAndPrivilegeWarnings(unittest.IsolatedAsyncioTestCase)
             if server.is_read_only:
                 await server._warn_if_file_privilege_enabled()
             self.assertFalse(mock_logger.error.called)
+
+
+class TestConnectionStreamBroken(unittest.TestCase):
+    """
+    asyncmy has changed how it exposes a broken connection stream across
+    versions: newer releases expose `_stream_broken`, older releases (down
+    to the pinned minimum asyncmy>=0.2.10) only expose `_reader`. The pool
+    must work against either.
+    """
+
+    def test_uses_stream_broken_property_when_present(self):
+        conn = MagicMock()
+        conn._stream_broken = True
+        self.assertTrue(_connection_stream_broken(conn))
+
+        conn._stream_broken = False
+        self.assertFalse(_connection_stream_broken(conn))
+
+    def test_falls_back_to_reader_when_stream_broken_absent(self):
+        class LegacyConnection:
+            def __init__(self, at_eof=False, exception=None):
+                self._reader = MagicMock()
+                self._reader.at_eof.return_value = at_eof
+                self._reader.exception.return_value = exception
+
+        broken = LegacyConnection(at_eof=True)
+        self.assertFalse(hasattr(broken, "_stream_broken"))
+        self.assertTrue(_connection_stream_broken(broken))
+
+        healthy = LegacyConnection(at_eof=False, exception=None)
+        self.assertFalse(_connection_stream_broken(healthy))
+
+    def test_handles_missing_reader_gracefully(self):
+        class BareConnection:
+            pass
+
+        self.assertFalse(_connection_stream_broken(BareConnection()))
+
+
+class TestSafePoolFillFreePool(unittest.IsolatedAsyncioTestCase):
+    async def test_discards_broken_connection_without_reader_attribute(self):
+        """Regression test: a connection exposing only `_stream_broken` (as in
+        newer asyncmy releases) must not raise AttributeError('_reader')."""
+
+        class BrokenConnection:
+            _stream_broken = True
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        pool = SafePool(minsize=0, maxsize=1)
+        conn = BrokenConnection()
+        pool._free.append(conn)
+
+        await pool.fill_free_pool()
+
+        self.assertTrue(conn.closed)
+        self.assertFalse(pool._free)
+
+    async def test_discards_broken_connection_with_legacy_reader_attribute(self):
+        """Regression test: a connection exposing only `_reader` (as in
+        asyncmy>=0.2.10, the pinned minimum) must still be discarded."""
+
+        class LegacyBrokenConnection:
+            def __init__(self):
+                self.closed = False
+                self._reader = MagicMock()
+                self._reader.at_eof.return_value = True
+                self._reader.exception.return_value = None
+
+            def close(self):
+                self.closed = True
+
+        pool = SafePool(minsize=0, maxsize=1)
+        conn = LegacyBrokenConnection()
+        pool._free.append(conn)
+
+        await pool.fill_free_pool()
+
+        self.assertTrue(conn.closed)
+        self.assertFalse(pool._free)
 
 
 @unittest.skipUnless(
