@@ -202,12 +202,61 @@ class TestQueryValidation(unittest.TestCase):
             "SELECT * FROM users -- LOAD_FILE('/etc/passwd')",
             "SELECT * FROM users /* LOAD_FILE('/etc/passwd') */",
             "SELECT * FROM users -- INTO OUTFILE '/tmp/test'",
+            "SELECT * FROM users # LOAD_FILE('/etc/passwd')",
         ]
         for query in queries:
             with self.subTest(query=query):
                 self.loop.run_until_complete(
                     self._test_query_allowed(query)
                 )
+
+    # MariaDB executable comment (/*! ... */) bypass tests.
+    # Executable comments are NOT inert: MariaDB executes their contents as
+    # live SQL, so validation must catch dangerous keywords hidden inside them.
+
+    def test_load_file_in_executable_comment_is_blocked(self):
+        """LOAD_FILE() hidden inside a /*! ... */ executable comment must be blocked."""
+        query = "SELECT 1 /*!50000 , LOAD_FILE('/etc/passwd') */"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "LOAD_FILE()")
+        )
+
+    def test_into_outfile_in_executable_comment_is_blocked(self):
+        """INTO OUTFILE hidden inside a /*! ... */ executable comment must be blocked."""
+        query = "SELECT 'pwned' /*!50000 INTO OUTFILE '/var/lib/mysql-files/pwned.txt' */"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "INTO OUTFILE")
+        )
+
+    def test_into_dumpfile_in_executable_comment_is_blocked(self):
+        """INTO DUMPFILE hidden inside a /*! ... */ executable comment must be blocked."""
+        query = "SELECT 'pwned' /*!50000 INTO DUMPFILE '/tmp/pwned.txt' */"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "INTO DUMPFILE")
+        )
+
+    def test_non_read_prefix_hidden_in_executable_comment_is_blocked(self):
+        """A write statement disguised via a leading executable comment must be blocked."""
+        query = "/*!50000 DROP*/ TABLE users"
+        self.loop.run_until_complete(
+            self._test_query_blocked(query, "read-only mode")
+        )
+
+    def test_load_file_in_string_still_allowed_with_executable_comment(self):
+        """LOAD_FILE text inside a genuine string literal remains allowed, even
+        when an unrelated executable comment is also present in the query."""
+        query = "SELECT 'LOAD_FILE(/etc/passwd)' /*!50000 as text */"
+        self.loop.run_until_complete(
+            self._test_query_allowed(query)
+        )
+
+    def test_inert_comment_mentioning_keywords_still_allowed(self):
+        """A genuinely inert /* ... */ comment (no leading !) must not trigger
+        false positives even if it mentions blocked keywords."""
+        query = "SELECT * FROM users /* not executable: LOAD_FILE INTO OUTFILE */"
+        self.loop.run_until_complete(
+            self._test_query_allowed(query)
+        )
 
 
 class TestClientCapabilityAndPrivilegeWarnings(unittest.IsolatedAsyncioTestCase):

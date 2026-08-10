@@ -295,31 +295,49 @@ class MariaDBServer:
 
         allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE')
 
-        # Strip SQL comments from query
-        sql_no_comments = re.sub(r'--.*?$', '', sql, flags=re.MULTILINE)
-        sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
-        sql_no_comments = sql_no_comments.strip()
+        # Build a normalized string for validation that reflects what MariaDB
+        # will actually execute. This must never *remove* content that the
+        # server treats as live SQL, or validation and execution diverge
+        # (parser differential). In particular, MariaDB "executable comments"
+        # (/*! ... */ and /*!VVVVV ... */) are NOT inert comments: their
+        # contents run as normal SQL. Only genuinely inert comments and
+        # string literal contents are safe to strip for validation purposes.
 
-        query_upper = sql_no_comments.upper()
+        # Mask string literals first, so comment-like sequences inside data
+        # cannot be mistaken for actual comment syntax below.
+        sql_normalized = re.sub(r"'(?:[^'\\]|\\.)*'", "''", sql)
+        sql_normalized = re.sub(r'"(?:[^"\\]|\\.)*"', '""', sql_normalized)
+
+        # Remove single-line comments (-- comment and # comment), which never execute.
+        sql_normalized = re.sub(r'--.*?$', '', sql_normalized, flags=re.MULTILINE)
+        sql_normalized = re.sub(r'#.*?$', '', sql_normalized, flags=re.MULTILINE)
+
+        # Remove inert block comments: /* ... */ that are NOT executable
+        # comments. Executable comments start with /*! and must be left
+        # for the next step so their contents remain visible to validation.
+        sql_normalized = re.sub(r'/\*(?!!)[\s\S]*?\*/', '', sql_normalized)
+
+        # Unwrap executable comments: strip only the /*! or /*!VVVVV marker
+        # and the closing */, keeping the inner SQL intact so it is subject
+        # to the same checks below as ordinary SQL.
+        sql_normalized = re.sub(r'/\*!\d*', ' ', sql_normalized)
+        sql_normalized = sql_normalized.replace('*/', ' ')
+        sql_normalized = sql_normalized.strip()
+
+        query_upper = sql_normalized.upper()
         is_allowed_read_query = any(query_upper.startswith(prefix) for prefix in allowed_prefixes)
 
         if self.is_read_only and not is_allowed_read_query:
              logger.warning(f"Blocked potentially non-read-only query in read-only mode: {sql[:100]}...")
              raise PermissionError("Operation forbidden: Server is in read-only mode.")
         if self.is_read_only:
-            # Remove string literals to avoid matching patterns inside strings
-            # Handle both single and double quoted strings
-            sql_no_strings = re.sub(r"'(?:[^'\\]|\\.)*'", "''", sql_no_comments)
-            sql_no_strings = re.sub(r'"(?:[^"\\]|\\.)*"', '""', sql_no_strings)
-            sql_no_strings_upper = sql_no_strings.upper()
-            
-            # Check for LOAD_FILE() function (case-insensitive, outside strings)
-            if re.search(r'\bLOAD_FILE\s*\(', sql_no_strings_upper):
+            # Check for LOAD_FILE() function (case-insensitive, outside strings/inert comments)
+            if re.search(r'\bLOAD_FILE\s*\(', query_upper):
                 logger.warning(f"Blocked query containing LOAD_FILE(): {sql[:100]}...")
                 raise PermissionError("Operation forbidden: LOAD_FILE() is not allowed for security reasons.")
-            
-            # Check for SELECT ... INTO OUTFILE/DUMPFILE (case-insensitive, outside strings)
-            if re.search(r'\bINTO\s+(OUTFILE|DUMPFILE)\b', sql_no_strings_upper):
+
+            # Check for SELECT ... INTO OUTFILE/DUMPFILE (case-insensitive, outside strings/inert comments)
+            if re.search(r'\bINTO\s+(OUTFILE|DUMPFILE)\b', query_upper):
                 logger.warning(f"Blocked query containing SELECT INTO OUTFILE or DUMPFILE: {sql[:100]}...")
                 raise PermissionError("Operation forbidden: SELECT INTO OUTFILE and SELECT INTO DUMPFILE are not allowed for security reasons.")
 
