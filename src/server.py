@@ -1,5 +1,13 @@
 # server.py
 
+# Cloudflare 100s idle timeout 대응: SSE keepalive ping (60초)
+import sse_starlette.sse as _sse
+_orig_init = _sse.EventSourceResponse.__init__
+def _patched_init(self, *args, **kwargs):
+    kwargs.setdefault('ping', 60)
+    _orig_init(self, *args, **kwargs)
+_sse.EventSourceResponse.__init__ = _patched_init
+
 # Import configuration settings
 from config import (
     DB_NAME,
@@ -10,6 +18,7 @@ from config import (
 )
 
 import asyncio
+import time
 import argparse
 import re
 from typing import List, Dict, Any, Optional
@@ -38,17 +47,28 @@ if EMBEDDING_PROVIDER is not None:
 
 from asyncmy.errors import Error as AsyncMyError
 
+class InstanceConfigError(ConnectionError):
+    """Instance config that cannot work no matter how often it is retried (missing user/password)."""
+
+
 # --- MariaDB MCP Server Class ---
 class MariaDBServer:
     """
     MCP Server exposing tools to interact with a MariaDB database.
     Manages the database connection pool.
     """
+    # A pool that failed at startup is retried on demand at most this often. Without a retry, a
+    # transient outage at startup would leave the instance unusable until the next restart.
+    POOL_RETRY_INTERVAL_SEC = 60
+
     def __init__(self, server_name="MariaDB_Server", autocommit=True):
         self.mcp = FastMCP(server_name)
         self.pools: Dict[str, asyncmy.Pool] = {}
         self.instance_configs: Dict[str, InstanceConfig] = {}
         self.default_instance: Optional[str] = None
+        # name -> (reason, monotonic time of last attempt, permanent)
+        self.failed_instances: Dict[str, tuple] = {}
+        self._pool_locks: Dict[str, asyncio.Lock] = {}
         self.autocommit = not MCP_READ_ONLY
         self.is_read_only = MCP_READ_ONLY
         logger.info(f"Initializing {server_name}...")
@@ -76,7 +96,11 @@ class MariaDBServer:
         return await self.create_vector_store_tool(database_name, vector_store_name, embedding_service, model_name, distance_function, instance_name=instance_name)
 
     async def initialize_pools(self):
-        """Initializes connection pools for all configured instances."""
+        """Initializes connection pools for all configured instances.
+
+        One unreachable instance must not take the whole server down: a failing instance is recorded in
+        failed_instances and skipped. Only when no pool at all can be created does this raise.
+        """
         if self.pools:
             logger.info("Connection pools already initialized.")
             return
@@ -86,75 +110,112 @@ class MariaDBServer:
         self.default_instance = config_data["default_instance"]
 
         for name, cfg in self.instance_configs.items():
-            if not cfg.user:
-                logger.error(f"Cannot initialize pool for '{name}': user is empty")
-                raise ConnectionError(f"Missing user for instance '{name}'.")
-            if not cfg.password:
-                logger.error(f"Cannot initialize pool for '{name}': password is missing")
-                raise ConnectionError(f"Missing password for instance '{name}'.")
-
             try:
-                ssl_context = None
-                if cfg.ssl:
-                    ssl_context = ssl.create_default_context()
-                    if cfg.ssl_ca:
-                        ca_path = os.path.expanduser(cfg.ssl_ca)
-                        if os.path.exists(ca_path):
-                            ssl_context.load_verify_locations(cafile=ca_path)
-                        else:
-                            logger.warning(f"[{name}] SSL CA not found: {ca_path}")
-
-                    if cfg.ssl_cert and cfg.ssl_key:
-                        cert_path = os.path.expanduser(cfg.ssl_cert)
-                        key_path = os.path.expanduser(cfg.ssl_key)
-                        if os.path.exists(cert_path) and os.path.exists(key_path):
-                            ssl_context.load_cert_chain(cert_path, key_path)
-                        else:
-                            logger.warning(f"[{name}] SSL cert/key not found")
-
-                    if not cfg.ssl_verify_cert:
-                        ssl_context.check_hostname = False
-                        ssl_context.verify_mode = ssl.CERT_NONE
-                    elif not cfg.ssl_verify_identity:
-                        ssl_context.check_hostname = False
-                        ssl_context.verify_mode = ssl.CERT_REQUIRED
-
-                pool_params = {
-                    "host": cfg.host,
-                    "port": cfg.port,
-                    "user": cfg.user,
-                    "password": cfg.password,
-                    "db": cfg.db,
-                    "minsize": 1,
-                    "maxsize": MCP_MAX_POOL_SIZE,
-                    "autocommit": self.autocommit,
-                    "pool_recycle": 3600,
-                }
-                if cfg.ssl and ssl_context is not None:
-                    pool_params["ssl"] = ssl_context
-                if cfg.charset:
-                    pool_params["charset"] = cfg.charset
-
-                logger.info(f"Creating pool for instance '{name}': {cfg.user}@{cfg.host}:{cfg.port}/{cfg.db}")
-                self.pools[name] = await create_safe_pool(**pool_params)
-                logger.info(f"Pool for instance '{name}' initialized successfully.")
-
-            except AsyncMyError as e:
-                logger.error(f"Failed to initialize pool for '{name}': {e}", exc_info=True)
-                raise
+                self.pools[name] = await self._create_pool(name, cfg)
+                self.failed_instances.pop(name, None)
             except Exception as e:
-                logger.error(f"Unexpected error initializing pool for '{name}': {e}", exc_info=True)
-                raise
+                self._record_failure(name, e)
 
-        logger.info(f"All {len(self.pools)} pool(s) initialized. Default: '{self.default_instance}'")
+        if not self.pools:
+            raise ConnectionError(f"No database pool could be initialized: {self._failure_summary()}")
+        if self.default_instance not in self.pools:
+            logger.warning(
+                f"Default instance '{self.default_instance}' is unavailable; "
+                f"calls without instance_name fail until it recovers."
+            )
+        logger.info(
+            f"{len(self.pools)}/{len(self.instance_configs)} pool(s) initialized "
+            f"(failed: {list(self.failed_instances) or 'none'}). Default: '{self.default_instance}'"
+        )
 
-    def _get_pool(self, instance_name: Optional[str] = None) -> asyncmy.Pool:
-        """Returns the pool for the given instance, or the default instance."""
+    async def _create_pool(self, name: str, cfg: InstanceConfig) -> asyncmy.Pool:
+        """Creates the pool for one instance. Raises on any failure."""
+        if not cfg.user:
+            raise InstanceConfigError("user is empty")
+        if not cfg.password:
+            raise InstanceConfigError("password is missing")
+
+        ssl_context = None
+        if cfg.ssl:
+            ssl_context = ssl.create_default_context()
+            if cfg.ssl_ca:
+                ca_path = os.path.expanduser(cfg.ssl_ca)
+                if os.path.exists(ca_path):
+                    ssl_context.load_verify_locations(cafile=ca_path)
+                else:
+                    logger.warning(f"[{name}] SSL CA not found: {ca_path}")
+
+            if cfg.ssl_cert and cfg.ssl_key:
+                cert_path = os.path.expanduser(cfg.ssl_cert)
+                key_path = os.path.expanduser(cfg.ssl_key)
+                if os.path.exists(cert_path) and os.path.exists(key_path):
+                    ssl_context.load_cert_chain(cert_path, key_path)
+                else:
+                    logger.warning(f"[{name}] SSL cert/key not found")
+
+            if not cfg.ssl_verify_cert:
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+            elif not cfg.ssl_verify_identity:
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+
+        pool_params = {
+            "host": cfg.host,
+            "port": cfg.port,
+            "user": cfg.user,
+            "password": cfg.password,
+            "db": cfg.db,
+            "minsize": 1,
+            "maxsize": MCP_MAX_POOL_SIZE,
+            "autocommit": self.autocommit,
+            "pool_recycle": 3600,
+        }
+        if cfg.ssl and ssl_context is not None:
+            pool_params["ssl"] = ssl_context
+        if cfg.charset:
+            pool_params["charset"] = cfg.charset
+
+        logger.info(f"Creating pool for instance '{name}': {cfg.user}@{cfg.host}:{cfg.port}/{cfg.db}")
+        pool = await create_safe_pool(**pool_params)
+        logger.info(f"Pool for instance '{name}' initialized successfully.")
+        return pool
+
+    def _record_failure(self, name: str, error: Exception) -> None:
+        reason = f"{type(error).__name__}: {error}"
+        permanent = isinstance(error, InstanceConfigError)
+        self.failed_instances[name] = (reason, time.monotonic(), permanent)
+        logger.error(f"Pool for instance '{name}' unavailable: {reason}", exc_info=not permanent)
+
+    def _failure_summary(self) -> Dict[str, str]:
+        return {name: reason for name, (reason, _, _) in self.failed_instances.items()}
+
+    async def _get_pool(self, instance_name: Optional[str] = None) -> asyncmy.Pool:
+        """Returns the pool for the given instance, or the default instance.
+
+        An instance that failed earlier is retried here, at most every POOL_RETRY_INTERVAL_SEC.
+        """
         name = instance_name or self.default_instance
-        if name not in self.pools:
-            available = list(self.pools.keys())
-            raise ValueError(f"Instance '{name}' not found. Available: {available}")
-        return self.pools[name]
+        if name in self.pools:
+            return self.pools[name]
+        if name not in self.failed_instances:
+            raise ValueError(f"Instance '{name}' not found. Available: {list(self.pools.keys())}")
+
+        lock = self._pool_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            if name in self.pools:
+                return self.pools[name]
+            reason, last_attempt, permanent = self.failed_instances[name]
+            if not permanent and time.monotonic() - last_attempt >= self.POOL_RETRY_INTERVAL_SEC:
+                logger.info(f"Retrying pool for instance '{name}' (last failure: {reason})")
+                try:
+                    self.pools[name] = await self._create_pool(name, self.instance_configs[name])
+                    del self.failed_instances[name]
+                    return self.pools[name]
+                except Exception as e:
+                    self._record_failure(name, e)
+                    reason = self.failed_instances[name][0]
+        raise ValueError(f"Instance '{name}' is unavailable: {reason}. Available: {list(self.pools.keys())}")
 
     def _get_instance_db(self, instance_name: Optional[str] = None) -> str:
         """Returns the default database name for the given instance."""
@@ -179,7 +240,7 @@ class MariaDBServer:
 
     async def _execute_query(self, sql: str, params: Optional[tuple] = None, database: Optional[str] = None, instance_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Helper function to execute queries using the pool for the given instance."""
-        pool = self._get_pool(instance_name)
+        pool = await self._get_pool(instance_name)
         instance_db = self._get_instance_db(instance_name)
 
         allowed_prefixes = ('SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'USE')
@@ -852,7 +913,10 @@ class MariaDBServer:
                     "host": cfg.host,
                     "db": cfg.db,
                     "is_default": name == self.default_instance,
+                    "available": name in self.pools,
                 }
+                if name in self.failed_instances:
+                    result[name]["error"] = self.failed_instances[name][0]
             return result
 
         @self.mcp.tool
