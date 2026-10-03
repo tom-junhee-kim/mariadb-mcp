@@ -21,6 +21,7 @@ import asyncio
 import time
 import argparse
 import re
+import sys
 from typing import List, Dict, Any, Optional
 from functools import partial
 import os
@@ -1063,3 +1064,6 @@ if __name__ == "__main__":
          exit_code = 1
     finally:
         logger.info(f"Server exiting with code {exit_code}.")
+
+    # Without an explicit exit status a failed startup ends with code 0 and the restart policy hides it.
+    sys.exit(exit_code)
