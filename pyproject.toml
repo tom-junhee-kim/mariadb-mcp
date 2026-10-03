@@ -13,3 +13,7 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "tokenizers==0.21.2",
 ]
+
+[tool.uv]
+# uv.lock is resolved as of the 2026-04-19 production image build; move this forward with `uv lock --upgrade` to take newer releases.
+exclude-newer = "2026-04-19T03:06:19Z"

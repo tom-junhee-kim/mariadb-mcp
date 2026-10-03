@@ -1,23 +1,22 @@
-FROM python:3.11-slim AS builder
+FROM python:3.11.15-slim AS builder
 
-# Install build dependencies and curl for uv installer
+# Build dependencies for packages that compile native extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates \
+    build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN curl -fsSL https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+# uv from its official image at a pinned version (no remote install script)
+COPY --from=ghcr.io/astral-sh/uv:0.11.31 /uv /uvx /bin/
 
 WORKDIR /app
 
 # Copy project files
 COPY . .
 
-# Install project dependencies into a local venv
-RUN uv sync --no-dev
+# Install exactly the versions in uv.lock into a local venv
+RUN uv sync --locked --no-dev
 
-FROM python:3.11-slim
+FROM python:3.11.15-slim
 LABEL maintainer="codescent" \
       project="mariadb-mcp"
 
