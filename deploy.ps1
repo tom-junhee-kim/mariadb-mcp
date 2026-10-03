@@ -1,5 +1,6 @@
 # mariadb-mcp 배포 (Windows → Linux)
 # - deploy.sh와 동일한 결과 보장 (rsync --delete 대체)
+# - instances.json 은 서버에만 둔다 - 자격증명이 든 운영 설정이라 업로드·삭제·재작성하지 않는다
 # - 사용법: .\deploy.ps1
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -14,13 +15,21 @@ if (-not (Test-Path ".env.production")) {
     exit 1
 }
 
+# instances.json 확인 - run.sh 가 이 파일을 마운트한다. 없으면 docker 가 그 자리에 디렉터리를 만들어 기동이 깨진다.
+# PowerShell 5.1 은 네이티브 명령의 비영 종료로 멈추지 않으므로 $LASTEXITCODE 를 직접 본다.
+ssh $Host_ "test -f $RemoteDir/instances.json"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "서버에 $RemoteDir/instances.json 이 없습니다. 배포를 중단합니다."
+    exit 1
+}
+
 # 컨테이너 중지 (배포 중 설정 불일치 방지)
 Write-Host "==> Stopping mariadb-mcp container"
 ssh $Host_ "docker stop mariadb-mcp 2>/dev/null || true"
 
 # --- 파일 동기화 (deploy.sh rsync --delete 대체) ---
 # 제외 대상 (deploy.sh --exclude와 동일)
-$ExcludeNames = @('deploy.sh', 'deploy.ps1', 'README.md', 'LICENSE', 'docker-compose.yml')
+$ExcludeNames = @('deploy.sh', 'deploy.ps1', 'README.md', 'LICENSE', 'docker-compose.yml', 'instances.json')
 $ExcludePatterns = @('.env*', '.git*', '*.example.json')
 $ExcludeDirs = @('.git', '.venv', '__pycache__', 'logs')
 
@@ -64,14 +73,14 @@ foreach ($item in @(Get-ChildItem $TempDir -Force)) {
 # 원격 정리 (업로드되지 않은 파일/디렉토리 제거)
 Write-Host "==> Cleaning up old files on remote"
 $UploadedNames = @(Get-ChildItem $TempDir -Force | ForEach-Object { [regex]::Escape($_.Name) })
-$PreserveRegex = '^(' + ($UploadedNames -join '|') + '|\.env.*|logs)$'
+$PreserveRegex = '^(' + ($UploadedNames -join '|') + '|\.env.*|logs|instances\.json)$'
 ssh $Host_ "cd $RemoteDir && ls -A | grep -v -E '$PreserveRegex' | xargs -r rm -rf"
 
 Remove-Item -Recurse -Force $TempDir
 
 # CRLF→LF 변환
 Write-Host "==> Converting CRLF to LF on remote"
-ssh $Host_ "cd $RemoteDir && find . -type f \( -name '*.sh' -o -name '*.py' -o -name '*.conf' -o -name '*.cnf' -o -name '*.cf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.toml' -o -name '*.json' -o -name '*.ini' -o -name '*.sql' -o -name '*.pem' -o -name 'Dockerfile' -o -name '.dockerignore' \) -exec sed -i 's/\r$//' {} +"
+ssh $Host_ "cd $RemoteDir && find . -type f ! -name 'instances.json' \( -name '*.sh' -o -name '*.py' -o -name '*.conf' -o -name '*.cnf' -o -name '*.cf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.toml' -o -name '*.json' -o -name '*.ini' -o -name '*.sql' -o -name '*.pem' -o -name 'Dockerfile' -o -name '.dockerignore' \) -exec sed -i 's/\r$//' {} +"
 
 # 스크립트 실행 권한 복원 (scp는 권한 미보존)
 ssh $Host_ "cd $RemoteDir && find . -name '*.sh' -exec chmod +x {} +"
