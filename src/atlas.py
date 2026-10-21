@@ -7,6 +7,7 @@
 #                  식별자(해시·경로·진행판 번호·인계 파일)를 서버에서 뽑아 chunk_idents 에 함께 넣는다.
 # - get_atlas    : (source, origin_key) 로 조각 전체를 연다. 연 기록(opened)을 events 에 남긴다.
 # - search_atlas : 종류별 상위 n + 시각·세션 제외 + 식별자 정확 일치. 보여 준 조각(shown)을 events 에 남긴다.
+import asyncio
 import hashlib
 import json
 import os
@@ -22,6 +23,10 @@ from config import logger
 ATLAS_DB = os.getenv("ATLAS_DB", "memory_atlas")
 _SUFFIX = os.getenv("ATLAS_TABLE_SUFFIX", "")          # 시험용: "_test" → chunks_test 등
 ATLAS_INSTANCE = os.getenv("ATLAS_INSTANCE", "codescent")
+# 벡터 인덱스는 행이 많은 종류에만 쓴다. 나머지는 인덱스 후 사후 필터가 후보를 잃으므로 정확 계산(거리 + 0 으로 인덱스 회피)한다.
+INDEX_SOURCES = set(filter(None, os.getenv("ATLAS_INDEX_SOURCES", "transcript").split(",")))
+EF_SEARCH = int(os.getenv("ATLAS_EF_SEARCH", "0"))     # 인덱스 탐색 폭 하한. 0 이면 INDEX_DEPTH 만큼
+INDEX_DEPTH = int(os.getenv("ATLAS_INDEX_DEPTH", "300"))   # 인덱스에서 받는 후보 수(필터는 받은 뒤 파이썬에서 건다)
 T_CHUNKS = f"chunks{_SUFFIX}"
 T_IDENTS = f"chunk_idents{_SUFFIX}"
 T_EVENTS = f"events{_SUFFIX}"
@@ -280,7 +285,8 @@ async def do_get(server, source: str, origin_key: str, chunk_no: Optional[int] =
 # search_atlas
 # ---------------------------------------------------------------------------
 _CAND_COLS = ("source, origin_key, chunk_no, machine, project, session_name, title, item_at, turn_at_source, rule_score, "
-              "content_hash, LEFT(document, 200) AS snippet")
+              "content_hash, JSON_VALUE(metadata,'$.doc_title') AS doc_title, JSON_VALUE(metadata,'$.section_title') AS section_title, "
+              "LEFT(document, 200) AS snippet, session_id, CAST(JSON_VALUE(metadata,'$.line_start') AS UNSIGNED) AS line_start")
 
 
 def _filters(before: Optional[int], exclude_session_id: Optional[str], exclude_after_line: Optional[int]) -> Tuple[str, List[Any]]:
@@ -301,6 +307,7 @@ def _filters(before: Optional[int], exclude_session_id: Optional[str], exclude_a
 def _norm(r: Dict[str, Any]) -> Dict[str, Any]:
     return {"source": r["source"], "origin_key": r["origin_key"], "chunk_no": int(r["chunk_no"]), "machine": r["machine"],
             "project": r["project"], "session_name": r["session_name"], "title": r["title"],
+            "doc_title": r.get("doc_title"), "section_title": r.get("section_title"),
             "item_at": None if r["item_at"] is None else int(r["item_at"]), "turn_at_source": r["turn_at_source"],
             "rule_score": None if r["rule_score"] is None else int(r["rule_score"]), "content_hash": r["content_hash"],
             "distance": float(r["distance"]), "snippet": r["snippet"]}
@@ -329,27 +336,55 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
     cands: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     per_src_count: Dict[str, int] = {}
     idents = extract_idents(query)
+    # 1) 종류별 벡터 후보 — 종류마다 연결을 따로 써서 동시에 묻는다. 필터는 후보를 뽑은 뒤 걸리므로 넉넉히 가져온다.
+    def keep_row(r) -> bool:
+        """인덱스 경로의 시각·세션 필터. SQL WHERE 는 인덱스가 뽑은 상위 후보에만 걸려 후보를 잃으므로 여기서 건다."""
+        if before is not None and (r["item_at"] is None or int(r["item_at"]) >= int(before)):
+            return False
+        if exclude_session_id and r["session_id"] == exclude_session_id:
+            if exclude_after_line is None:
+                return False
+            return r["line_start"] is not None and int(r["line_start"]) < int(exclude_after_line)
+        return True
+
+    async def vector_candidates(s: str):
+        want = per_source_n * (4 if s == "machine_doc" else 3)
+        use_index = s in INDEX_SOURCES
+        dist = "VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s))"
+        async with pool.acquire() as c2:
+            async with c2.cursor(cursor=asyncmy.cursors.DictCursor) as cu:
+                if not use_index:   # 행이 적은 종류: 정확 계산 + SQL 필터
+                    sql = (f"SELECT {_CAND_COLS}, {dist} AS distance FROM {Q_CHUNKS} "
+                           f"WHERE source=%s{fsql} ORDER BY {dist} + 0 LIMIT %s")
+                    await cu.execute(sql, tuple([qtext, s] + fparams + [qtext, want]))
+                    return s, await cu.fetchall()
+                depth = max(INDEX_DEPTH, want)
+                ef = max(EF_SEARCH, depth)   # 인덱스는 ef_search 개까지만 돌려준다
+                sql = f"SELECT {_CAND_COLS}, {dist} AS distance FROM {Q_CHUNKS} WHERE source=%s ORDER BY {dist} LIMIT %s"
+                await cu.execute(f"SET SESSION mhnsw_ef_search={int(ef)}")
+                try:
+                    await cu.execute(sql, (qtext, s, qtext, depth))
+                    rows = [r for r in await cu.fetchall() if keep_row(r)]
+                    return s, rows[:want]
+                finally:
+                    await cu.execute("SET SESSION mhnsw_ef_search=DEFAULT")
+
+    for s_name, rows in await asyncio.gather(*[vector_candidates(s) for s in srcs]):
+        n = 0
+        for r in rows:
+            c = _norm(r)
+            c["cand_from"] = "vector"
+            cands[(c["source"], c["origin_key"], c["chunk_no"])] = c
+            n += 1
+        per_src_count[s_name] = n
     async with pool.acquire() as conn:
         async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
-            # 1) 종류별 벡터 후보 — ORDER BY 는 거리 호출 그대로(인덱스를 쓰게). WHERE 는 후보를 뽑은 뒤 걸리므로 넉넉히 가져온다.
-            for s in srcs:
-                limit = per_source_n * (4 if s == "machine_doc" else 3)
-                sql = (f"SELECT {_CAND_COLS}, VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) AS distance FROM {Q_CHUNKS} "
-                       f"WHERE source=%s{fsql} ORDER BY VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) LIMIT %s")
-                await cur.execute(sql, tuple([qtext, s] + fparams + [qtext, limit]))
-                rows = await cur.fetchall()
-                n = 0
-                for r in rows:
-                    c = _norm(r)
-                    c["cand_from"] = "vector"
-                    cands[(c["source"], c["origin_key"], c["chunk_no"])] = c
-                    n += 1
-                per_src_count[s] = n
             # 2) 식별자 정확 일치 후보
             for tok, _t in idents[:5]:
                 sql = (f"SELECT c.source AS source, c.origin_key AS origin_key, c.chunk_no AS chunk_no, c.machine AS machine, "
                        f"c.project AS project, c.session_name AS session_name, c.title AS title, c.item_at AS item_at, "
                        f"c.turn_at_source AS turn_at_source, c.rule_score AS rule_score, c.content_hash AS content_hash, "
+                       f"JSON_VALUE(c.metadata,'$.doc_title') AS doc_title, JSON_VALUE(c.metadata,'$.section_title') AS section_title, "
                        f"LEFT(c.document, 200) AS snippet, VEC_DISTANCE_COSINE(c.embedding, VEC_FromText(%s)) AS distance "
                        f"FROM {Q_IDENTS} i JOIN {Q_CHUNKS} c ON c.source=i.source AND c.origin_key=i.origin_key AND c.chunk_no=i.chunk_no "
                        f"WHERE i.token=%s AND c.source IN ({','.join(['%s'] * len(srcs))})"
