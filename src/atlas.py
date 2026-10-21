@@ -21,9 +21,13 @@ from config import logger
 
 ATLAS_DB = os.getenv("ATLAS_DB", "memory_atlas")
 _SUFFIX = os.getenv("ATLAS_TABLE_SUFFIX", "")          # 시험용: "_test" → chunks_test 등
+ATLAS_INSTANCE = os.getenv("ATLAS_INSTANCE", "codescent")
 T_CHUNKS = f"chunks{_SUFFIX}"
 T_IDENTS = f"chunk_idents{_SUFFIX}"
 T_EVENTS = f"events{_SUFFIX}"
+Q_CHUNKS = f"`{ATLAS_DB}`.`{T_CHUNKS}`"
+Q_IDENTS = f"`{ATLAS_DB}`.`{T_IDENTS}`"
+Q_EVENTS = f"`{ATLAS_DB}`.`{T_EVENTS}`"
 SOURCES = ("transcript", "auto_memory", "workspace_memory", "machine_doc")
 EMBED_MODEL_TAG = "bge-m3-korean/1024"
 MAX_CHUNKS_PER_CALL = 16
@@ -93,7 +97,7 @@ async def _log_events(cur, rows: List[Dict[str, Any]]) -> None:
     """events 에 기록한다. 실패해도 호출한 도구는 실패시키지 않는다."""
     if not rows:
         return
-    sql = (f"INSERT IGNORE INTO `{T_EVENTS}` (event, event_at, ref_source, ref_origin_key, ref_chunk_no, machine, project, "
+    sql = (f"INSERT IGNORE INTO {Q_EVENTS} (event, event_at, ref_source, ref_origin_key, ref_chunk_no, machine, project, "
            "session_id, session_name, prompt_sha1, distance, rank_no, event_uid) "
            "VALUES (%s, UTC_TIMESTAMP(3), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
     try:
@@ -102,6 +106,7 @@ async def _log_events(cur, rows: List[Dict[str, Any]]) -> None:
                                     r.get("project"), r.get("session_id") or "", r.get("session_name"), r.get("prompt_sha1"),
                                     r.get("distance"), r.get("rank_no"),
                                     _event_uid(r.get("machine") or "unknown", r.get("session_id") or "", r["event"], r["source"], r["origin_key"], r.get("chunk_no"))))
+        await cur.execute("COMMIT")
     except Exception as e:  # noqa: BLE001
         logger.warning(f"atlas: events 기록 실패(무시): {e}")
 
@@ -126,6 +131,7 @@ async def do_add(server, emb, source: str, origin_key: str, chunks: List[Dict[st
                     only_if_newer: bool = False, instance_name: Optional[str] = None) -> Dict[str, Any]:
     _check_source(source)
     _check_key(origin_key)
+    instance_name = instance_name or ATLAS_INSTANCE
     if not isinstance(chunks, list) or not chunks:
         raise ValueError("chunks must be a non-empty list")
     if len(chunks) > MAX_CHUNKS_PER_CALL:
@@ -135,7 +141,6 @@ async def do_add(server, emb, source: str, origin_key: str, chunks: List[Dict[st
     max_chunk_count: Optional[int] = None
     async with pool.acquire() as conn:
         async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
-            await cur.execute(f"USE `{ATLAS_DB}`")
             for ch in sorted(chunks, key=lambda c: int(c.get("chunk_no", 0))):
                 t0 = time.time()
                 res: Dict[str, Any] = {"chunk_no": int(ch.get("chunk_no", 0))}
@@ -153,12 +158,12 @@ async def do_add(server, emb, source: str, origin_key: str, chunks: List[Dict[st
                     res.update({"status": "error", "error": str(e)[:300]})
                 res["ms"] = int((time.time() - t0) * 1000)
                 results.append(res)
-            # 파일이 줄어 조각 수가 줄었으면 넘치는 옛 조각을 지운다(오류가 없었을 때만)
-            if max_chunk_count is not None and not any(r["status"] == "error" for r in results):
+            # 파일이 줄어 조각 수가 줄었으면 넘치는 옛 조각을 지운다. 건너뛴 조각이 오래된 판일 수 있으므로 모든 조각이 반영됐을 때만
+            if max_chunk_count is not None and all(r["status"] in ("inserted", "replaced", "skipped_exists") for r in results):
                 try:
                     await conn.begin()
-                    await cur.execute(f"DELETE FROM `{T_IDENTS}` WHERE source=%s AND origin_key=%s AND chunk_no>=%s", (source, origin_key, max_chunk_count))
-                    await cur.execute(f"DELETE FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no>=%s", (source, origin_key, max_chunk_count))
+                    await cur.execute(f"DELETE FROM {Q_IDENTS} WHERE source=%s AND origin_key=%s AND chunk_no>=%s", (source, origin_key, max_chunk_count))
+                    await cur.execute(f"DELETE FROM {Q_CHUNKS} WHERE source=%s AND origin_key=%s AND chunk_no>=%s", (source, origin_key, max_chunk_count))
                     await conn.commit()
                 except Exception as e:  # noqa: BLE001
                     await conn.rollback()
@@ -194,7 +199,7 @@ async def _add_one(cur, conn, emb, source: str, origin_key: str, ch: Dict[str, A
     try:
         await cur.execute(
             f"SELECT item_at, content_hash, JSON_VALUE(metadata,'$.chunker_version') AS cv, JSON_VALUE(metadata,'$.ident_version') AS iv, "
-            f"JSON_VALUE(metadata,'$.file_hash') AS fh FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no=%s",
+            f"JSON_VALUE(metadata,'$.file_hash') AS fh FROM {Q_CHUNKS} WHERE source=%s AND origin_key=%s AND chunk_no=%s",
             (source, origin_key, chunk_no))
         row = await cur.fetchone()
     finally:
@@ -215,19 +220,19 @@ async def _add_one(cur, conn, emb, source: str, origin_key: str, ch: Dict[str, A
         raise RuntimeError(f"unexpected embedding dimension: {len(vec)}")
 
     # 3) 식별자 — 같은 조각 본문과 앞뒤 문맥(조각 경계에 걸린 긴 경로 대비)에서 뽑는다
-    ident_src = f"{ch.get('before') or ''}\n{document}\n{ch.get('after') or ''}"
+    ident_src = f"{(ch.get('before') or '')[-_MAX_TOKEN:]}{document}{(ch.get('after') or '')[:_MAX_TOKEN]}"
     idents = extract_idents(ident_src)
 
     # 4) 저장
     await conn.begin()
     try:
         if replacing:
-            await cur.execute(f"DELETE FROM `{T_IDENTS}` WHERE source=%s AND origin_key=%s AND chunk_no=%s", (source, origin_key, chunk_no))
-            await cur.execute(f"DELETE FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no=%s", (source, origin_key, chunk_no))
-        await cur.execute(f"INSERT INTO `{T_CHUNKS}` (document, embedding, metadata) VALUES (%s, VEC_FromText(%s), %s)",
+            await cur.execute(f"DELETE FROM {Q_IDENTS} WHERE source=%s AND origin_key=%s AND chunk_no=%s", (source, origin_key, chunk_no))
+            await cur.execute(f"DELETE FROM {Q_CHUNKS} WHERE source=%s AND origin_key=%s AND chunk_no=%s", (source, origin_key, chunk_no))
+        await cur.execute(f"INSERT INTO {Q_CHUNKS} (document, embedding, metadata) VALUES (%s, VEC_FromText(%s), %s)",
                           (document, _vec_text(vec), json.dumps(meta, ensure_ascii=False)))
         for tok, rtype in idents:
-            await cur.execute(f"INSERT IGNORE INTO `{T_IDENTS}` (token, ident_type, source, origin_key, chunk_no) VALUES (%s,%s,%s,%s,%s)",
+            await cur.execute(f"INSERT IGNORE INTO {Q_IDENTS} (token, ident_type, source, origin_key, chunk_no) VALUES (%s,%s,%s,%s,%s)",
                               (tok, rtype, source, origin_key, chunk_no))
         await conn.commit()
     except Exception:
@@ -244,11 +249,10 @@ async def do_get(server, source: str, origin_key: str, chunk_no: Optional[int] =
                     session_name: Optional[str] = None, instance_name: Optional[str] = None) -> Dict[str, Any]:
     _check_source(source)
     _check_key(origin_key)
-    pool = await server._get_pool(instance_name)
+    pool = await server._get_pool(instance_name or ATLAS_INSTANCE)
     async with pool.acquire() as conn:
         async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
-            await cur.execute(f"USE `{ATLAS_DB}`")
-            sql = f"SELECT chunk_no, document, metadata FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s"
+            sql = f"SELECT chunk_no, document, metadata FROM {Q_CHUNKS} WHERE source=%s AND origin_key=%s"
             params: List[Any] = [source, origin_key]
             if chunk_no is not None:
                 sql += " AND chunk_no=%s"
@@ -321,17 +325,16 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
     embed_ms = int((time.time() - t0) * 1000)
     qtext = _vec_text(qvec)
     fsql, fparams = _filters(before, exclude_session_id, exclude_after_line)
-    pool = await server._get_pool(instance_name)
+    pool = await server._get_pool(instance_name or ATLAS_INSTANCE)
     cands: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     per_src_count: Dict[str, int] = {}
     idents = extract_idents(query)
     async with pool.acquire() as conn:
         async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
-            await cur.execute(f"USE `{ATLAS_DB}`")
             # 1) 종류별 벡터 후보 — ORDER BY 는 거리 호출 그대로(인덱스를 쓰게). WHERE 는 후보를 뽑은 뒤 걸리므로 넉넉히 가져온다.
             for s in srcs:
                 limit = per_source_n * (4 if s == "machine_doc" else 3)
-                sql = (f"SELECT {_CAND_COLS}, VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) AS distance FROM `{T_CHUNKS}` "
+                sql = (f"SELECT {_CAND_COLS}, VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) AS distance FROM {Q_CHUNKS} "
                        f"WHERE source=%s{fsql} ORDER BY VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) LIMIT %s")
                 await cur.execute(sql, tuple([qtext, s] + fparams + [qtext, limit]))
                 rows = await cur.fetchall()
@@ -348,7 +351,7 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                        f"c.project AS project, c.session_name AS session_name, c.title AS title, c.item_at AS item_at, "
                        f"c.turn_at_source AS turn_at_source, c.rule_score AS rule_score, c.content_hash AS content_hash, "
                        f"LEFT(c.document, 200) AS snippet, VEC_DISTANCE_COSINE(c.embedding, VEC_FromText(%s)) AS distance "
-                       f"FROM `{T_IDENTS}` i JOIN `{T_CHUNKS}` c ON c.source=i.source AND c.origin_key=i.origin_key AND c.chunk_no=i.chunk_no "
+                       f"FROM {Q_IDENTS} i JOIN {Q_CHUNKS} c ON c.source=i.source AND c.origin_key=i.origin_key AND c.chunk_no=i.chunk_no "
                        f"WHERE i.token=%s AND c.source IN ({','.join(['%s'] * len(srcs))})"
                        + fsql.replace(" AND item_at", " AND c.item_at").replace("session_id", "c.session_id").replace("JSON_VALUE(metadata", "JSON_VALUE(c.metadata")
                        + " ORDER BY c.item_at DESC LIMIT 20")

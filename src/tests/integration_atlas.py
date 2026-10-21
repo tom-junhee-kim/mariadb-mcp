@@ -61,6 +61,7 @@ async def main():
     server, emb = FakeServer(), EmbeddingService()
     tag = uuid.uuid4().hex[:8]
     ws = f"it{tag}"
+    sid = None
     key = f"{ws}/docs/atlas.md"
     docs = ["MariaDB 벡터 인덱스는 ORDER BY 가 거리 호출 그대로일 때만 쓰입니다. 커밋 cd2b506 참고.",
             "임베딩 서버는 단일 워커로 직렬 처리하며 512토큰을 넘으면 뒤를 버립니다.",
@@ -69,7 +70,7 @@ async def main():
         # 1) 넣기
         r = await atlas.do_add(server, emb, "workspace_memory", key, [chunk(i, 3, d, doc_title="아틀라스 시험") for i, d in enumerate(docs)])
         check("add: 3 inserted", r["counts"] == {"inserted": 3}, str(r["counts"]))
-        idr = await q(server, f"SELECT token FROM `{atlas.T_IDENTS}` WHERE source=%s AND origin_key=%s", ("workspace_memory", key))
+        idr = await q(server, f"SELECT token FROM {atlas.Q_IDENTS} WHERE source=%s AND origin_key=%s", ("workspace_memory", key))
         toks = {x["token"] for x in idr}
         check("idents: hash/board/handoff", {"cd2b506", "m-16", "handoffs/atlas-test.md"} <= toks, str(toks))
 
@@ -83,7 +84,7 @@ async def main():
         # 3) 본문이 바뀌면 갈아 끼움
         r = await atlas.do_add(server, emb, "workspace_memory", key, [chunk(1, 3, docs[1] + " 수정됨", doc_title="아틀라스 시험")])
         check("add changed: replaced", r["counts"] == {"replaced": 1}, str(r["counts"]))
-        n = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no=1", ("workspace_memory", key))
+        n = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_CHUNKS} WHERE source=%s AND origin_key=%s AND chunk_no=1", ("workspace_memory", key))
         check("replace: 행 1개 유지", n[0]["n"] == 1)
 
         # 4) only_if_newer
@@ -92,10 +93,25 @@ async def main():
 
         # 5) 조각 수가 줄면 넘치는 조각 정리
         r = await atlas.do_add(server, emb, "workspace_memory", key, [chunk(0, 2, docs[0], doc_title="아틀라스 시험"), chunk(1, 2, docs[1] + " 수정됨", doc_title="아틀라스 시험")])
-        n = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_CHUNKS}` WHERE source=%s AND origin_key=%s", ("workspace_memory", key))
+        n = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_CHUNKS} WHERE source=%s AND origin_key=%s", ("workspace_memory", key))
         check("chunk_count 감소: 넘치는 조각 삭제", n[0]["n"] == 2, str(n))
-        n = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_IDENTS}` WHERE source=%s AND origin_key=%s AND chunk_no>=2", ("workspace_memory", key))
+        n = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_IDENTS} WHERE source=%s AND origin_key=%s AND chunk_no>=2", ("workspace_memory", key))
         check("chunk_count 감소: 식별자도 삭제", n[0]["n"] == 0, str(n))
+
+        # 5-2) 오래된 판(조각 수 1)이 only_if_newer 로 들어와도 새 판의 꼬리 조각을 지우지 않는다
+        await atlas.do_add(server, emb, "workspace_memory", key, [chunk(2, 3, docs[2])])
+        r = await atlas.do_add(server, emb, "workspace_memory", key, [chunk(0, 1, docs[0] + " 오래된 판", item_at=1)], only_if_newer=True)
+        n = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_CHUNKS} WHERE source=%s AND origin_key=%s", ("workspace_memory", key))
+        check("only_if_newer 로 건너뛴 오래된 판은 꼬리 조각을 지우지 않음", r["counts"] == {"skipped_older": 1} and n[0]["n"] == 3, f"{r['counts']} {n}")
+        await atlas.do_add(server, emb, "workspace_memory", key, [chunk(0, 2, docs[0], doc_title="아틀라스 시험"), chunk(1, 2, docs[1] + " 수정됨", doc_title="아틀라스 시험")])
+
+        # 5-3) 조각 경계에 걸린 경로는 앞뒤 문맥으로 살린다
+        bkey = f"{ws}/docs/boundary.md"
+        bc = chunk(0, 1, "ire-direction.md 를 읽고 정리했다")
+        bc["before"] = "참고 reports/graphiti-ret"
+        await atlas.do_add(server, emb, "workspace_memory", bkey, [bc])
+        bt = {x["token"] for x in await q(server, f"SELECT token FROM {atlas.Q_IDENTS} WHERE source=%s AND origin_key=%s", ("workspace_memory", bkey))}
+        check("idents: 경계에 걸린 경로(before 문맥)", "reports/graphiti-retire-direction.md" in bt, str(bt))
 
         # 6) 필수 칸 누락·잘못된 source
         r = await atlas.do_add(server, emb, "workspace_memory", key + "x", [{"chunk_no": 0, "document": "x", "metadata": {"machine": "isD"}}])
@@ -109,7 +125,7 @@ async def main():
         # 7) get_atlas
         g = await atlas.do_get(server, "workspace_memory", key, session_id=f"s-{tag}", machine="isD")
         check("get: 조각 순서", [c["chunk_no"] for c in g["chunks"]] == [0, 1], str(g["found"]))
-        ev = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_EVENTS}` WHERE event='opened' AND ref_origin_key=%s", (key,))
+        ev = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_EVENTS} WHERE event='opened' AND ref_origin_key=%s", (key,))
         check("get: opened 기록", ev[0]["n"] == 1, str(ev))
 
         # 8) 트랜스크립트 두 개(한 세션) + 머신 문서 사본 두 개(같은 내용, 다른 머신)
@@ -120,6 +136,7 @@ async def main():
         await atlas.do_add(server, emb, "machine_doc", f"isD:{ws}.md#1", [chunk(0, 1, md, machine="isD")])
         await atlas.do_add(server, emb, "machine_doc", f"CS:{ws}.md#1", [chunk(0, 1, md, machine="CS")])
 
+        await asyncio.sleep(1.5)  # MaxScale 이 읽기를 복제본으로 보내므로 복제 반영을 기다린다
         s = await atlas.do_search(server, emb, "임베딩 서버 직렬 처리", return_n=20, top_n=3, machine="isD", session_id=f"s-{tag}", session_name="it")
         res = s["results"]
         mdocs = [c for c in res if c["source"] == "machine_doc" and ws in c["origin_key"]]
@@ -150,23 +167,27 @@ async def main():
         check("search: before 가 식별자 후보에도 적용(대조군)", not any(c["origin_key"] == ikey for c in s5c["results"]))
 
         # 10) shown 기록
-        ev = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_EVENTS}` WHERE event='shown' AND session_id=%s", (f"s-{tag}",))
+        ev = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_EVENTS} WHERE event='shown' AND session_id=%s", (f"s-{tag}",))
         check("search: shown 기록(상위 3)", ev[0]["n"] == 3, str(ev))
         s6 = await atlas.do_search(server, emb, "임베딩 서버 직렬 처리", log_shown=False, session_id=f"s-{tag}-2")
-        ev = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_EVENTS}` WHERE session_id=%s", (f"s-{tag}-2",))
+        ev = await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_EVENTS} WHERE session_id=%s", (f"s-{tag}-2",))
         check("search: log_shown=False 면 기록 없음(대조군)", ev[0]["n"] == 0 and s6["results"])
     finally:
         # 내가 만든 시험 행만 지운다
         like = f"%{ws}%"
-        for t in (atlas.T_IDENTS, atlas.T_CHUNKS):
-            await q(server, f"DELETE FROM `{t}` WHERE origin_key LIKE %s OR origin_key LIKE %s", (like, f"{ws}%"))
-        sids = await q(server, f"SELECT DISTINCT session_id FROM `{atlas.T_CHUNKS}` WHERE project='it-proj'")
-        for x in sids:
-            await q(server, f"DELETE FROM `{atlas.T_IDENTS}` WHERE origin_key LIKE %s", (f"{x['session_id']}:%",))
-        await q(server, f"DELETE FROM `{atlas.T_CHUNKS}` WHERE project='it-proj'")
-        await q(server, f"DELETE FROM `{atlas.T_EVENTS}` WHERE session_id LIKE %s OR ref_origin_key LIKE %s", (f"s-{tag}%", like))
-        left = await q(server, f"SELECT COUNT(*) AS n FROM `{atlas.T_CHUNKS}` WHERE project='it-proj'")
-        check("정리: 시험 행 0", left[0]["n"] == 0)
+        keys = [f"%{ws}%"] + ([f"{sid}:%"] if sid else [])
+        for t in (atlas.Q_IDENTS, atlas.Q_CHUNKS):
+            for k in keys:
+                await q(server, f"DELETE FROM {t} WHERE origin_key LIKE %s", (k,))
+        for k in keys:
+            await q(server, f"DELETE FROM {atlas.Q_EVENTS} WHERE ref_origin_key LIKE %s", (k,))
+        await q(server, f"DELETE FROM {atlas.Q_EVENTS} WHERE session_id LIKE %s", (f"s-{tag}%",))
+        left = 0
+        for t, col in ((atlas.Q_CHUNKS, "origin_key"), (atlas.Q_IDENTS, "origin_key"), (atlas.Q_EVENTS, "ref_origin_key")):
+            for k in keys:
+                left += (await q(server, f"SELECT COUNT(*) AS n FROM {t} WHERE {col} LIKE %s", (k,)))[0]["n"]
+        left += (await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_EVENTS} WHERE session_id LIKE %s", (f"s-{tag}%",)))[0]["n"]
+        check("정리: 시험 행(chunks·idents·events) 0", left == 0, str(left))
     print("RESULT", "OK" if not FAILS else f"FAIL {FAILS}")
     return 0 if not FAILS else 1
 
