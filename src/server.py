@@ -976,6 +976,9 @@ class MariaDBServer:
                 """Search a vector store for similar documents."""
                 return await self.search_vector_store(user_query, database_name, vector_store_name, k, instance_name=instance_name)
 
+            from atlas import register_atlas_tools
+            register_atlas_tools(self, embedding_service)
+
         logger.info("Registered MCP tools explicitly.")
 
     # --- Async Main Server Logic ---

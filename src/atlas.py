@@ -1,0 +1,430 @@
+# atlas.py — 메모리 아틀라스 도구 3개: search_atlas · get_atlas · add_atlas
+#
+# DB `memory_atlas` 의 표 chunks / chunk_idents / events 를 다룬다. 스키마와 규칙의 정본은
+# 워크스페이스 플랜(메모리 아틀라스)이다. 기존 도구(search_vector_store 등)는 건드리지 않는다.
+#
+# - add_atlas    : 조각을 넣는다. 키·버전·해시가 같으면 임베딩 전에 건너뛰고, 다르면 갈아 끼우고,
+#                  식별자(해시·경로·진행판 번호·인계 파일)를 서버에서 뽑아 chunk_idents 에 함께 넣는다.
+# - get_atlas    : (source, origin_key) 로 조각 전체를 연다. 연 기록(opened)을 events 에 남긴다.
+# - search_atlas : 종류별 상위 n + 시각·세션 제외 + 식별자 정확 일치. 보여 준 조각(shown)을 events 에 남긴다.
+import hashlib
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import asyncmy
+
+from config import logger
+
+ATLAS_DB = os.getenv("ATLAS_DB", "memory_atlas")
+_SUFFIX = os.getenv("ATLAS_TABLE_SUFFIX", "")          # 시험용: "_test" → chunks_test 등
+T_CHUNKS = f"chunks{_SUFFIX}"
+T_IDENTS = f"chunk_idents{_SUFFIX}"
+T_EVENTS = f"events{_SUFFIX}"
+SOURCES = ("transcript", "auto_memory", "workspace_memory", "machine_doc")
+EMBED_MODEL_TAG = "bge-m3-korean/1024"
+MAX_CHUNKS_PER_CALL = 16
+MAX_DOC_CHARS = 8000
+
+# ---------------------------------------------------------------------------
+# 식별자 추출 — 규칙은 ident_rules.json 한 곳. 저장(add_atlas)과 질의(search_atlas)가 같은 코드를 쓴다.
+# ---------------------------------------------------------------------------
+_RULES_PATH = Path(__file__).resolve().parent / "ident_rules.json"
+_RULES_RAW = _RULES_PATH.read_bytes()
+IDENT_RULES_SHA = hashlib.sha256(_RULES_RAW).hexdigest()[:16]
+_RULES_DOC = json.loads(_RULES_RAW.decode("utf-8"))
+IDENT_VERSION = str(_RULES_DOC["version"])
+_LOWER = bool(_RULES_DOC.get("lowercase", True))
+_MAX_TOKEN = int(_RULES_DOC.get("max_token_len", 160))
+_MAX_PER_TEXT = int(_RULES_DOC.get("max_per_text", 60))
+_RULES: List[Tuple[str, "re.Pattern[str]"]] = []
+for _r in _RULES_DOC["rules"]:
+    _flags = re.IGNORECASE if "i" in _r.get("flags", "") else 0
+    _RULES.append((_r["type"], re.compile(_r["regex"], _flags)))
+logger.info(f"atlas ident rules loaded: version={IDENT_VERSION} sha256={IDENT_RULES_SHA}")
+
+
+def extract_idents(text: str) -> List[Tuple[str, str]]:
+    """text 에서 (token, type) 목록을 뽑는다. 규칙 순서대로, 토큰 중복은 처음 것만, 상한 초과분은 버린다."""
+    seen: Dict[str, str] = {}
+    for rtype, rx in _RULES:
+        for m in rx.finditer(text or ""):
+            tok = m.group(0)
+            if _LOWER:
+                tok = tok.lower()
+            if not tok or len(tok) > _MAX_TOKEN or tok in seen:
+                continue
+            seen[tok] = rtype
+            if len(seen) >= _MAX_PER_TEXT:
+                return list(seen.items())
+    return list(seen.items())
+
+
+# ---------------------------------------------------------------------------
+# 공통 도우미
+# ---------------------------------------------------------------------------
+def _check_source(source: str) -> None:
+    if source not in SOURCES:
+        raise ValueError(f"source must be one of {SOURCES}: {source!r}")
+
+
+def _check_key(origin_key: str) -> None:
+    if not origin_key or not isinstance(origin_key, str) or len(origin_key) > 400:
+        raise ValueError("origin_key must be a non-empty string of at most 400 characters")
+
+
+def _hash16(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _vec_text(vec: List[float]) -> str:
+    return json.dumps([float(x) for x in vec])
+
+
+def _event_uid(machine: str, session_id: str, event: str, source: str, origin_key: str, chunk_no: Optional[int]) -> str:
+    raw = "|".join([machine, session_id, event, source, origin_key, "" if chunk_no is None else str(chunk_no), str(time.time_ns() // 1_000_000)])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+async def _log_events(cur, rows: List[Dict[str, Any]]) -> None:
+    """events 에 기록한다. 실패해도 호출한 도구는 실패시키지 않는다."""
+    if not rows:
+        return
+    sql = (f"INSERT IGNORE INTO `{T_EVENTS}` (event, event_at, ref_source, ref_origin_key, ref_chunk_no, machine, project, "
+           "session_id, session_name, prompt_sha1, distance, rank_no, event_uid) "
+           "VALUES (%s, UTC_TIMESTAMP(3), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+    try:
+        for r in rows:
+            await cur.execute(sql, (r["event"], r["source"], r["origin_key"], r.get("chunk_no"), r.get("machine") or "unknown",
+                                    r.get("project"), r.get("session_id") or "", r.get("session_name"), r.get("prompt_sha1"),
+                                    r.get("distance"), r.get("rank_no"),
+                                    _event_uid(r.get("machine") or "unknown", r.get("session_id") or "", r["event"], r["source"], r["origin_key"], r.get("chunk_no"))))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"atlas: events 기록 실패(무시): {e}")
+
+
+# ---------------------------------------------------------------------------
+# add_atlas
+# ---------------------------------------------------------------------------
+def _embed_text(source: str, document: str, meta: Dict[str, Any]) -> str:
+    """파일류는 「문서 제목 › 절 제목」 머리글을 붙여 임베딩한다(저장되는 document 에는 붙이지 않는다)."""
+    if source == "transcript":
+        return document
+    title = meta.get("doc_title")
+    section = meta.get("section_title")
+    if title and section:
+        return f"{title} › {section}\n{document}"
+    if title:
+        return f"{title}\n{document}"
+    return document
+
+
+async def do_add(server, emb, source: str, origin_key: str, chunks: List[Dict[str, Any]],
+                    only_if_newer: bool = False, instance_name: Optional[str] = None) -> Dict[str, Any]:
+    _check_source(source)
+    _check_key(origin_key)
+    if not isinstance(chunks, list) or not chunks:
+        raise ValueError("chunks must be a non-empty list")
+    if len(chunks) > MAX_CHUNKS_PER_CALL:
+        raise ValueError(f"at most {MAX_CHUNKS_PER_CALL} chunks per call")
+    pool = await server._get_pool(instance_name)
+    results: List[Dict[str, Any]] = []
+    max_chunk_count: Optional[int] = None
+    async with pool.acquire() as conn:
+        async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
+            await cur.execute(f"USE `{ATLAS_DB}`")
+            for ch in sorted(chunks, key=lambda c: int(c.get("chunk_no", 0))):
+                t0 = time.time()
+                res: Dict[str, Any] = {"chunk_no": int(ch.get("chunk_no", 0))}
+                try:
+                    res.update(await _add_one(cur, conn, emb, source, origin_key, ch, only_if_newer))
+                    cc = ch.get("chunk_count")
+                    if isinstance(cc, int) and cc > 0:
+                        max_chunk_count = cc
+                except Exception as e:  # noqa: BLE001
+                    try:
+                        await conn.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.error(f"atlas add_atlas 조각 실패 {source}:{origin_key}#{res['chunk_no']}: {e}", exc_info=True)
+                    res.update({"status": "error", "error": str(e)[:300]})
+                res["ms"] = int((time.time() - t0) * 1000)
+                results.append(res)
+            # 파일이 줄어 조각 수가 줄었으면 넘치는 옛 조각을 지운다(오류가 없었을 때만)
+            if max_chunk_count is not None and not any(r["status"] == "error" for r in results):
+                try:
+                    await conn.begin()
+                    await cur.execute(f"DELETE FROM `{T_IDENTS}` WHERE source=%s AND origin_key=%s AND chunk_no>=%s", (source, origin_key, max_chunk_count))
+                    await cur.execute(f"DELETE FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no>=%s", (source, origin_key, max_chunk_count))
+                    await conn.commit()
+                except Exception as e:  # noqa: BLE001
+                    await conn.rollback()
+                    logger.warning(f"atlas: 넘치는 조각 정리 실패(무시): {e}")
+    counts: Dict[str, int] = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    return {"source": source, "origin_key": origin_key, "counts": counts, "results": results,
+            "ident_version": IDENT_VERSION, "ident_rules_sha": IDENT_RULES_SHA}
+
+
+async def _add_one(cur, conn, emb, source: str, origin_key: str, ch: Dict[str, Any], only_if_newer: bool) -> Dict[str, Any]:
+    document = ch.get("document")
+    if not isinstance(document, str) or not document.strip():
+        raise ValueError("document must be a non-empty string")
+    if len(document) > MAX_DOC_CHARS:
+        raise ValueError(f"document too long: {len(document)} > {MAX_DOC_CHARS}")
+    chunk_no = int(ch.get("chunk_no", 0))
+    meta = dict(ch.get("metadata") or {})
+    for need in ("machine", "item_at"):
+        if meta.get(need) in (None, ""):
+            raise ValueError(f"metadata.{need} is required")
+    meta["item_at"] = int(meta["item_at"])
+    chash = _hash16(document)
+    meta.update({"source": source, "origin_key": origin_key, "chunk_no": chunk_no,
+                 "chunk_count": int(ch.get("chunk_count") or meta.get("chunk_count") or 1),
+                 "content_hash": chash, "ident_version": IDENT_VERSION})
+    meta.setdefault("embed_model", EMBED_MODEL_TAG)
+    meta.setdefault("chunker_version", "1")
+
+    # 1) 이미 있는가 — 트랜잭션 안에서 읽어 MaxScale 이 마스터로 보내게 한다(방금 넣은 행을 못 보는 일 방지)
+    await conn.begin()
+    try:
+        await cur.execute(
+            f"SELECT item_at, content_hash, JSON_VALUE(metadata,'$.chunker_version') AS cv, JSON_VALUE(metadata,'$.ident_version') AS iv, "
+            f"JSON_VALUE(metadata,'$.file_hash') AS fh FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no=%s",
+            (source, origin_key, chunk_no))
+        row = await cur.fetchone()
+    finally:
+        await conn.rollback()
+    replacing = False
+    if row:
+        if only_if_newer and int(row["item_at"]) >= meta["item_at"]:
+            return {"status": "skipped_older"}
+        same = (row["content_hash"] == chash and str(row["cv"]) == str(meta["chunker_version"])
+                and str(row["iv"]) == IDENT_VERSION and (row["fh"] or "") == str(meta.get("file_hash") or ""))
+        if same:
+            return {"status": "skipped_exists"}
+        replacing = True
+
+    # 2) 임베딩(트랜잭션 밖에서)
+    vec = await emb.embed(_embed_text(source, document, meta))
+    if len(vec) != 1024:
+        raise RuntimeError(f"unexpected embedding dimension: {len(vec)}")
+
+    # 3) 식별자 — 같은 조각 본문과 앞뒤 문맥(조각 경계에 걸린 긴 경로 대비)에서 뽑는다
+    ident_src = f"{ch.get('before') or ''}\n{document}\n{ch.get('after') or ''}"
+    idents = extract_idents(ident_src)
+
+    # 4) 저장
+    await conn.begin()
+    try:
+        if replacing:
+            await cur.execute(f"DELETE FROM `{T_IDENTS}` WHERE source=%s AND origin_key=%s AND chunk_no=%s", (source, origin_key, chunk_no))
+            await cur.execute(f"DELETE FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s AND chunk_no=%s", (source, origin_key, chunk_no))
+        await cur.execute(f"INSERT INTO `{T_CHUNKS}` (document, embedding, metadata) VALUES (%s, VEC_FromText(%s), %s)",
+                          (document, _vec_text(vec), json.dumps(meta, ensure_ascii=False)))
+        for tok, rtype in idents:
+            await cur.execute(f"INSERT IGNORE INTO `{T_IDENTS}` (token, ident_type, source, origin_key, chunk_no) VALUES (%s,%s,%s,%s,%s)",
+                              (tok, rtype, source, origin_key, chunk_no))
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    return {"status": "replaced" if replacing else "inserted", "idents": len(idents)}
+
+
+# ---------------------------------------------------------------------------
+# get_atlas
+# ---------------------------------------------------------------------------
+async def do_get(server, source: str, origin_key: str, chunk_no: Optional[int] = None, record_open: bool = True,
+                    session_id: str = "", machine: str = "unknown", project: Optional[str] = None,
+                    session_name: Optional[str] = None, instance_name: Optional[str] = None) -> Dict[str, Any]:
+    _check_source(source)
+    _check_key(origin_key)
+    pool = await server._get_pool(instance_name)
+    async with pool.acquire() as conn:
+        async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
+            await cur.execute(f"USE `{ATLAS_DB}`")
+            sql = f"SELECT chunk_no, document, metadata FROM `{T_CHUNKS}` WHERE source=%s AND origin_key=%s"
+            params: List[Any] = [source, origin_key]
+            if chunk_no is not None:
+                sql += " AND chunk_no=%s"
+                params.append(int(chunk_no))
+            sql += " ORDER BY chunk_no"
+            await cur.execute(sql, tuple(params))
+            rows = await cur.fetchall()
+            chunks = []
+            for r in rows:
+                m = r["metadata"]
+                if isinstance(m, str):
+                    try:
+                        m = json.loads(m)
+                    except Exception:  # noqa: BLE001
+                        pass
+                chunks.append({"chunk_no": r["chunk_no"], "document": r["document"], "metadata": m})
+            if record_open and chunks:
+                await _log_events(cur, [{"event": "opened", "source": source, "origin_key": origin_key,
+                                         "chunk_no": None if chunk_no is None else int(chunk_no),
+                                         "machine": machine, "project": project, "session_id": session_id, "session_name": session_name}])
+    return {"source": source, "origin_key": origin_key, "found": len(chunks), "chunks": chunks}
+
+
+# ---------------------------------------------------------------------------
+# search_atlas
+# ---------------------------------------------------------------------------
+_CAND_COLS = ("source, origin_key, chunk_no, machine, project, session_name, title, item_at, turn_at_source, rule_score, "
+              "content_hash, LEFT(document, 200) AS snippet")
+
+
+def _filters(before: Optional[int], exclude_session_id: Optional[str], exclude_after_line: Optional[int]) -> Tuple[str, List[Any]]:
+    sql, params = "", []
+    if before is not None:
+        sql += " AND item_at < %s"
+        params.append(int(before))
+    if exclude_session_id:
+        if exclude_after_line is not None:
+            sql += " AND (session_id IS NULL OR session_id <> %s OR CAST(JSON_VALUE(metadata,'$.line_start') AS UNSIGNED) < %s)"
+            params += [exclude_session_id, int(exclude_after_line)]
+        else:
+            sql += " AND (session_id IS NULL OR session_id <> %s)"
+            params.append(exclude_session_id)
+    return sql, params
+
+
+def _norm(r: Dict[str, Any]) -> Dict[str, Any]:
+    return {"source": r["source"], "origin_key": r["origin_key"], "chunk_no": int(r["chunk_no"]), "machine": r["machine"],
+            "project": r["project"], "session_name": r["session_name"], "title": r["title"],
+            "item_at": None if r["item_at"] is None else int(r["item_at"]), "turn_at_source": r["turn_at_source"],
+            "rule_score": None if r["rule_score"] is None else int(r["rule_score"]), "content_hash": r["content_hash"],
+            "distance": float(r["distance"]), "snippet": r["snippet"]}
+
+
+async def do_search(server, emb, query: str, sources: Optional[List[str]] = None, per_source_n: int = 15,
+                       return_n: int = 10, top_n: int = 3, before: Optional[int] = None,
+                       exclude_session_id: Optional[str] = None, exclude_after_line: Optional[int] = None,
+                       machine: Optional[str] = None, project: Optional[str] = None, session_id: Optional[str] = None,
+                       session_name: Optional[str] = None, log_shown: bool = True,
+                       instance_name: Optional[str] = None) -> Dict[str, Any]:
+    if not query or not isinstance(query, str):
+        raise ValueError("query must be a non-empty string")
+    srcs = list(sources) if sources else list(SOURCES)
+    for s in srcs:
+        _check_source(s)
+    per_source_n = max(1, min(int(per_source_n), 100))
+    return_n = max(1, min(int(return_n), 50))
+    top_n = max(0, min(int(top_n), return_n))
+    t0 = time.time()
+    qvec = await emb.embed(query)
+    embed_ms = int((time.time() - t0) * 1000)
+    qtext = _vec_text(qvec)
+    fsql, fparams = _filters(before, exclude_session_id, exclude_after_line)
+    pool = await server._get_pool(instance_name)
+    cands: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    per_src_count: Dict[str, int] = {}
+    idents = extract_idents(query)
+    async with pool.acquire() as conn:
+        async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
+            await cur.execute(f"USE `{ATLAS_DB}`")
+            # 1) 종류별 벡터 후보 — ORDER BY 는 거리 호출 그대로(인덱스를 쓰게). WHERE 는 후보를 뽑은 뒤 걸리므로 넉넉히 가져온다.
+            for s in srcs:
+                limit = per_source_n * (4 if s == "machine_doc" else 3)
+                sql = (f"SELECT {_CAND_COLS}, VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) AS distance FROM `{T_CHUNKS}` "
+                       f"WHERE source=%s{fsql} ORDER BY VEC_DISTANCE_COSINE(embedding, VEC_FromText(%s)) LIMIT %s")
+                await cur.execute(sql, tuple([qtext, s] + fparams + [qtext, limit]))
+                rows = await cur.fetchall()
+                n = 0
+                for r in rows:
+                    c = _norm(r)
+                    c["cand_from"] = "vector"
+                    cands[(c["source"], c["origin_key"], c["chunk_no"])] = c
+                    n += 1
+                per_src_count[s] = n
+            # 2) 식별자 정확 일치 후보
+            for tok, _t in idents[:5]:
+                sql = (f"SELECT c.source AS source, c.origin_key AS origin_key, c.chunk_no AS chunk_no, c.machine AS machine, "
+                       f"c.project AS project, c.session_name AS session_name, c.title AS title, c.item_at AS item_at, "
+                       f"c.turn_at_source AS turn_at_source, c.rule_score AS rule_score, c.content_hash AS content_hash, "
+                       f"LEFT(c.document, 200) AS snippet, VEC_DISTANCE_COSINE(c.embedding, VEC_FromText(%s)) AS distance "
+                       f"FROM `{T_IDENTS}` i JOIN `{T_CHUNKS}` c ON c.source=i.source AND c.origin_key=i.origin_key AND c.chunk_no=i.chunk_no "
+                       f"WHERE i.token=%s AND c.source IN ({','.join(['%s'] * len(srcs))})"
+                       + fsql.replace(" AND item_at", " AND c.item_at").replace("session_id", "c.session_id").replace("JSON_VALUE(metadata", "JSON_VALUE(c.metadata")
+                       + " ORDER BY c.item_at DESC LIMIT 20")
+                await cur.execute(sql, tuple([qtext, tok] + srcs + fparams))
+                for r in await cur.fetchall():
+                    key = (r["source"], r["origin_key"], int(r["chunk_no"]))
+                    if key in cands:
+                        cands[key]["cand_from"] = "both"
+                    else:
+                        c = _norm(r)
+                        c["cand_from"] = "ident"
+                        cands[key] = c
+            # 3) 머신 문서는 머신별 사본이 같은 내용이면 하나로 접는다(같은 머신 것 우선)
+            folded: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            keep: List[Dict[str, Any]] = []
+            for c in cands.values():
+                if c["source"] == "machine_doc" and c["content_hash"]:
+                    k = (c["source"], c["content_hash"])
+                    cur_best = folded.get(k)
+                    better = (cur_best is None or (c["machine"] == machine and cur_best["machine"] != machine)
+                              or (c["distance"] < cur_best["distance"] and (cur_best["machine"] != machine or c["machine"] == machine)))
+                    if better:
+                        if cur_best is not None and cur_best["cand_from"] != c["cand_from"]:
+                            c["cand_from"] = "both"
+                        folded[k] = c
+                else:
+                    keep.append(c)
+            keep.extend(folded.values())
+            # 4) 정렬: 식별자 일치 조각 먼저, 그다음 거리(C0: score = 1 − 거리). 순위식은 3단계 시험 뒤 여기에 들어온다.
+            for c in keep:
+                c["score"] = round(1.0 - c["distance"], 6)
+            keep.sort(key=lambda c: (0 if c["cand_from"] in ("ident", "both") else 1, c["distance"]))
+            out = keep[:return_n]
+            for i, c in enumerate(out):
+                c["rank"] = i + 1
+                c["shown"] = i < top_n
+            # 5) 보여 준 조각을 events 에 기록
+            if log_shown and top_n:
+                qsha = hashlib.sha1(query.encode("utf-8")).hexdigest()
+                await _log_events(cur, [{"event": "shown", "source": c["source"], "origin_key": c["origin_key"], "chunk_no": c["chunk_no"],
+                                         "machine": machine, "project": project, "session_id": session_id, "session_name": session_name,
+                                         "prompt_sha1": qsha, "distance": c["distance"], "rank_no": c["rank"]} for c in out if c["shown"]])
+    return {"results": out, "meta": {"total_ms": int((time.time() - t0) * 1000), "embed_ms": embed_ms,
+                                      "per_source_fetched": per_src_count, "idents": [t for t, _ in idents],
+                                      "ident_rules_sha": IDENT_RULES_SHA}}
+
+
+# ---------------------------------------------------------------------------
+# MCP 등록 — server.register_tools() 에서 한 줄로 부른다
+# ---------------------------------------------------------------------------
+def register_atlas_tools(server, embedding_service) -> None:
+    mcp = server.mcp
+
+    @mcp.tool
+    async def search_atlas(query: str, sources: Optional[List[str]] = None, per_source_n: int = 15, return_n: int = 10,
+                                top_n: int = 3, before: Optional[int] = None, exclude_session_id: Optional[str] = None,
+                                exclude_after_line: Optional[int] = None, machine: Optional[str] = None,
+                                project: Optional[str] = None, session_id: Optional[str] = None,
+                                session_name: Optional[str] = None, log_shown: bool = True,
+                                instance_name: Optional[str] = None) -> Dict[str, Any]:
+        """Search the memory atlas (transcripts, auto-memory, workspace memory, machine docs) by meaning plus exact identifiers (commit hash, path, board no)."""
+        return await do_search(server, embedding_service, query, sources, per_source_n, return_n, top_n, before,
+                                  exclude_session_id, exclude_after_line, machine, project, session_id, session_name,
+                                  log_shown, instance_name)
+
+    @mcp.tool
+    async def get_atlas(source: str, origin_key: str, chunk_no: Optional[int] = None, record_open: bool = True,
+                             session_id: str = "", machine: str = "unknown", project: Optional[str] = None,
+                             session_name: Optional[str] = None, instance_name: Optional[str] = None) -> Dict[str, Any]:
+        """Open the full chunks of one atlas item by source and origin_key (as listed by search_atlas)."""
+        return await do_get(server, source, origin_key, chunk_no, record_open, session_id, machine, project, session_name, instance_name)
+
+    @mcp.tool
+    async def add_atlas(source: str, origin_key: str, chunks: List[Dict[str, Any]], only_if_newer: bool = False,
+                             instance_name: Optional[str] = None) -> Dict[str, Any]:
+        """Add or replace atlas chunks (pipeline only). Skips unchanged chunks before embedding and records identifiers."""
+        return await do_add(server, embedding_service, source, origin_key, chunks, only_if_newer, instance_name)
+
+    logger.info("Registered atlas tools: search_atlas, get_atlas, add_atlas")

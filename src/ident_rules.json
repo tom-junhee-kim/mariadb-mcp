@@ -1,0 +1,32 @@
+{
+  "version": "1",
+  "lowercase": true,
+  "max_token_len": 160,
+  "max_per_text": 60,
+  "rules": [
+    {
+      "type": "hash",
+      "comment": "커밋 해시 등 16진수 7~40자. 숫자와 a~f 가 모두 있어야 한다(영단어·날짜 오탐 방지). 소문자만.",
+      "regex": "(?<![0-9A-Za-z])(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![0-9A-Za-z])",
+      "flags": ""
+    },
+    {
+      "type": "handoff",
+      "comment": "인계 파일 경로 handoffs/...md",
+      "regex": "handoffs/[\\w.\\-]+\\.md",
+      "flags": "i"
+    },
+    {
+      "type": "path",
+      "comment": "디렉터리를 포함한 파일 경로(알려진 확장자)",
+      "regex": "(?:[\\w.\\-]+/)+[\\w.\\-]+\\.(?:md|py|sh|ps1|ts|tsx|js|json|tsv|yml|yaml|toml|sql|conf|cnf|env|txt)\\b",
+      "flags": "i"
+    },
+    {
+      "type": "board_no",
+      "comment": "진행판 번호. 접두사는 H L F J O E M D G K B V 에 한정",
+      "regex": "\\b[HLFJOEMDGKBV]-\\d+\\b",
+      "flags": "i"
+    }
+  ]
+}
