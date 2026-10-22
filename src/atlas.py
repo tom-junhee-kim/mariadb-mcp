@@ -41,7 +41,8 @@ Q_IDENTS = f"`{ATLAS_DB}`.`{T_IDENTS}`"
 Q_EVENTS = f"`{ATLAS_DB}`.`{T_EVENTS}`"
 SOURCES = ("transcript", "auto_memory", "workspace_memory", "machine_doc")
 EMBED_MODEL_TAG = os.getenv("ATLAS_EMBED_MODEL_TAG", "bge-m3-korean/1024")   # 저장 행의 metadata.embed_model
-QUERY_PREFIX = os.getenv("ATLAS_QUERY_PREFIX", "")   # 질의 임베딩 앞에 붙이는 접두어(arctic-embed 는 "query: "). 임베딩 서버가 이 접두어로 질의를 알아본다
+_QP = os.getenv("ATLAS_QUERY_PREFIX", "").strip()   # 질의 임베딩 앞에 붙이는 접두어(arctic-embed 는 "query:"). env-file 은 값 끝 공백을 보존하지 않으므로 공백 한 칸은 코드가 붙인다
+QUERY_PREFIX = _QP + " " if _QP else ""   # 임베딩 서버가 이 접두어("query: ")로 질의를 알아본다
 MAX_CHUNKS_PER_CALL = 16
 MAX_DOC_CHARS = 8000
 
