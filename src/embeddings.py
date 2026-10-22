@@ -54,6 +54,12 @@ OPENAI_MODEL_DIMENSIONS = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072
 }
+# OpenAI 호환 프록시(litellm 등)에 등록된 모델 이름을 쓰는 경우: 이름과 차원을 환경변수로 받는다.
+_OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL")
+if _OPENAI_EMBEDDING_MODEL:
+    ALLOWED_OPENAI_MODELS = ALLOWED_OPENAI_MODELS + [_OPENAI_EMBEDDING_MODEL]
+    DEFAULT_OPENAI_MODEL = _OPENAI_EMBEDDING_MODEL
+    OPENAI_MODEL_DIMENSIONS[_OPENAI_EMBEDDING_MODEL] = int(os.getenv("OPENAI_EMBEDDING_DIM", "1024"))
 # Gemini Embedding Models
 ALLOWED_GEMINI_MODELS: List[str] = ["text-embedding-004"]
 DEFAULT_GEMINI_MODEL: str = "text-embedding-004"
