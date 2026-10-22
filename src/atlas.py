@@ -29,6 +29,8 @@ INDEX_SOURCES = set(filter(None, os.getenv("ATLAS_INDEX_SOURCES", "transcript").
 EF_SEARCH = int(os.getenv("ATLAS_EF_SEARCH", "0"))     # 인덱스 탐색 폭 하한. 0 이면 INDEX_DEPTH 만큼
 INDEX_DEPTH = int(os.getenv("ATLAS_INDEX_DEPTH", "300"))
 # 메모리 정확 계산(atlas_mem.py). 켜면 벡터를 프로세스 메모리에 올려 코사인을 정확히 계산하고, 준비되기 전의 검색은 위 인덱스 경로로 대신한다.
+IDENT_MAX_TOKENS = int(os.getenv("ATLAS_IDENT_MAX_TOKENS", "10"))   # 질의에서 정확 일치를 찾는 식별자 수
+IDENT_PER_TOKEN = int(os.getenv("ATLAS_IDENT_PER_TOKEN", "30"))      # 토큰마다 최신순으로 받는 조각 수
 EXACT_MEMORY = os.getenv("ATLAS_EXACT_MEMORY", "") == "1"
 MEM: Optional[MemoryIndex] = None   # 인덱스에서 받는 후보 수(필터는 받은 뒤 파이썬에서 건다)
 T_CHUNKS = f"chunks{_SUFFIX}"
@@ -340,6 +342,7 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
     cands: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     per_src_count: Dict[str, int] = {}
     idents = extract_idents(query)
+    ident_w: Dict[Tuple[str, str, int], float] = {}
     # 1) 종류별 벡터 후보 — 종류마다 연결을 따로 써서 동시에 묻는다. 필터는 후보를 뽑은 뒤 걸리므로 넉넉히 가져온다.
     def keep_row(r) -> bool:
         """인덱스 경로의 시각·세션 필터. SQL WHERE 는 인덱스가 뽑은 상위 후보에만 걸려 후보를 잃으므로 여기서 건다."""
@@ -391,7 +394,7 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
     async with pool.acquire() as conn:
         async with conn.cursor(cursor=asyncmy.cursors.DictCursor) as cur:
             # 2) 식별자 정확 일치 후보
-            for tok, _t in idents[:5]:
+            for tok, _t in idents[:IDENT_MAX_TOKENS]:
                 sql = (f"SELECT c.source AS source, c.origin_key AS origin_key, c.chunk_no AS chunk_no, c.machine AS machine, "
                        f"c.project AS project, c.session_name AS session_name, c.title AS title, c.item_at AS item_at, "
                        f"c.turn_at_source AS turn_at_source, c.rule_score AS rule_score, c.content_hash AS content_hash, "
@@ -400,10 +403,13 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                        f"FROM {Q_IDENTS} i JOIN {Q_CHUNKS} c ON c.source=i.source AND c.origin_key=i.origin_key AND c.chunk_no=i.chunk_no "
                        f"WHERE i.token=%s AND c.source IN ({','.join(['%s'] * len(srcs))})"
                        + fsql.replace(" AND item_at", " AND c.item_at").replace("session_id", "c.session_id").replace("JSON_VALUE(metadata", "JSON_VALUE(c.metadata")
-                       + " ORDER BY c.item_at DESC LIMIT 20")
+                       + f" ORDER BY c.item_at DESC LIMIT {IDENT_PER_TOKEN}")
                 await cur.execute(sql, tuple([qtext, tok] + srcs + fparams))
-                for r in await cur.fetchall():
+                ident_rows = await cur.fetchall()
+                w = 1.0 / max(1, len(ident_rows))     # 맞춘 조각이 적은(희귀한) 토큰일수록 가중이 크다
+                for r in ident_rows:
                     key = (r["source"], r["origin_key"], int(r["chunk_no"]))
+                    ident_w[key] = ident_w.get(key, 0.0) + w
                     if key in cands:
                         cands[key]["cand_from"] = "both"
                     else:
@@ -429,7 +435,8 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
             # 4) 정렬: 식별자 일치 조각 먼저, 그다음 거리(C0: score = 1 − 거리). 순위식은 3단계 시험 뒤 여기에 들어온다.
             for c in keep:
                 c["score"] = round(1.0 - c["distance"], 6)
-            keep.sort(key=lambda c: (0 if c["cand_from"] in ("ident", "both") else 1, c["distance"]))
+            keep.sort(key=lambda c: (0 if c["cand_from"] in ("ident", "both") else 1,
+                                     -ident_w.get((c["source"], c["origin_key"], c["chunk_no"]), 0.0), c["distance"]))
             out = keep[:return_n]
             for i, c in enumerate(out):
                 c["rank"] = i + 1
