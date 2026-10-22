@@ -195,21 +195,34 @@ async def main():
                 sql_d = [float(x["d"]) for x in rows]
                 mem_d = [c["distance"] for c in mem_top[src]]
                 check(f"memory: {src} 상위 8 거리가 SQL 정확 계산과 1e-5 안에서 같다", len(sql_d) == len(mem_d) and all(abs(a - b) < 1e-5 for a, b in zip(sql_d, mem_d)), f"{sql_d[:3]} vs {mem_d[:3]}")
+            # 준비 전 검색은 인덱스 경로로 대신 동작한다
+            ready_mem = atlas.MEM
+            cold = MemoryIndex(server, atlas.Q_CHUNKS, "x")
+            cold.started = True      # 백그라운드 적재를 시작하지 않는다(준비 안 된 상태 유지)
+            atlas.MEM = cold
+            try:
+                rc = await atlas.do_search(server, emb, qtxt, log_shown=False)
+            finally:
+                atlas.MEM = ready_mem
+            check("memory: 준비 전에는 인덱스 경로로 대신하고 결과가 있다", rc["meta"]["exact_memory"] is False and len(rc["results"]) > 0, str(rc["meta"]))
             # 신선도: 새 행은 갱신 뒤 바로 검색에 나오고, 같은 키를 갈아 끼우면 옛 행이 빠진다
             fkey = f"{ws}/docs/fresh.md"
             uniq = f"신선도 시험용 문장 {tag} 고유한 내용 알파 베타 감마"
             await atlas.do_add(server, emb, "workspace_memory", fkey, [chunk(0, 1, uniq, item_at=1_700_000_300_000)])
             before_n = len(atlas.MEM.slot_by_id)
+            await asyncio.sleep(1.5)   # 읽기는 복제본으로 가므로 복제 반영을 기다린다
             await atlas.MEM.refresh_once()
             check("memory: 새 행이 갱신 뒤 메모리에 들어온다", len(atlas.MEM.slot_by_id) == before_n + 1, f"{before_n} → {len(atlas.MEM.slot_by_id)}")
             rr = await atlas.do_search(server, emb, uniq, sources=["workspace_memory"], return_n=3, log_shown=False)
             check("memory: 새 행이 검색 1위", bool(rr["results"]) and rr["results"][0]["origin_key"] == fkey, str([c["origin_key"] for c in rr["results"]]))
             await atlas.do_add(server, emb, "workspace_memory", fkey, [chunk(0, 1, uniq + " 수정본", item_at=1_700_000_400_000)])
+            await asyncio.sleep(1.5)
             await atlas.MEM.refresh_once()
             n_mem = len(atlas.MEM.slot_by_id)
             n_db = (await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_CHUNKS}"))[0]["n"]
             check("memory: 갈아 끼운 뒤 옛 행이 빠져 메모리 행 수 = DB 행 수", n_mem == n_db, f"mem {n_mem} db {n_db}")
             await q(server, f"DELETE FROM {atlas.Q_CHUNKS} WHERE origin_key=%s", (fkey,))
+            await asyncio.sleep(1.5)
             await atlas.MEM.refresh_once()
             n_db = (await q(server, f"SELECT COUNT(*) AS n FROM {atlas.Q_CHUNKS}"))[0]["n"]
             check("memory: 지운 행이 빠진다", len(atlas.MEM.slot_by_id) == n_db, f"mem {len(atlas.MEM.slot_by_id)} db {n_db}")
