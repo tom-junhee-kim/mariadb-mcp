@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncmy
 
 from config import logger
+from atlas_mem import MemoryIndex
 
 ATLAS_DB = os.getenv("ATLAS_DB", "memory_atlas")
 _SUFFIX = os.getenv("ATLAS_TABLE_SUFFIX", "")          # 시험용: "_test" → chunks_test 등
@@ -26,7 +27,10 @@ ATLAS_INSTANCE = os.getenv("ATLAS_INSTANCE", "codescent")
 # 벡터 인덱스는 행이 많은 종류에만 쓴다. 나머지는 인덱스 후 사후 필터가 후보를 잃으므로 정확 계산(거리 + 0 으로 인덱스 회피)한다.
 INDEX_SOURCES = set(filter(None, os.getenv("ATLAS_INDEX_SOURCES", "transcript").split(",")))
 EF_SEARCH = int(os.getenv("ATLAS_EF_SEARCH", "0"))     # 인덱스 탐색 폭 하한. 0 이면 INDEX_DEPTH 만큼
-INDEX_DEPTH = int(os.getenv("ATLAS_INDEX_DEPTH", "300"))   # 인덱스에서 받는 후보 수(필터는 받은 뒤 파이썬에서 건다)
+INDEX_DEPTH = int(os.getenv("ATLAS_INDEX_DEPTH", "300"))
+# 메모리 정확 계산(atlas_mem.py). 켜면 벡터를 프로세스 메모리에 올려 코사인을 정확히 계산하고, 준비되기 전의 검색은 위 인덱스 경로로 대신한다.
+EXACT_MEMORY = os.getenv("ATLAS_EXACT_MEMORY", "") == "1"
+MEM: Optional[MemoryIndex] = None   # 인덱스에서 받는 후보 수(필터는 받은 뒤 파이썬에서 건다)
 T_CHUNKS = f"chunks{_SUFFIX}"
 T_IDENTS = f"chunk_idents{_SUFFIX}"
 T_EVENTS = f"events{_SUFFIX}"
@@ -369,10 +373,17 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                 finally:
                     await cu.execute("SET SESSION mhnsw_ef_search=DEFAULT")
 
-    for s_name, rows in await asyncio.gather(*[vector_candidates(s) for s in srcs]):
+    mem_rows = None
+    if MEM is not None:
+        MEM.ensure_started()
+        if MEM.ready:
+            wants = {s: per_source_n * (4 if s == "machine_doc" else 3) for s in srcs}
+            mem_rows = MEM.search(qvec, wants, before, exclude_session_id, exclude_after_line)
+    vec_results = list(mem_rows.items()) if mem_rows is not None else await asyncio.gather(*[vector_candidates(s) for s in srcs])
+    for s_name, rows in vec_results:
         n = 0
         for r in rows:
-            c = _norm(r)
+            c = dict(r) if mem_rows is not None else _norm(r)
             c["cand_from"] = "vector"
             cands[(c["source"], c["origin_key"], c["chunk_no"])] = c
             n += 1
@@ -423,6 +434,16 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
             for i, c in enumerate(out):
                 c["rank"] = i + 1
                 c["shown"] = i < top_n
+            # 4-2) 메모리 경로의 후보는 본문 앞부분(snippet)을 상위 후보만 DB 에서 읽어 채운다
+            need = [c for c in out if c.get("snippet") is None and c.get("_id")]
+            if need:
+                ph = ",".join(["%s"] * len(need))
+                await cur.execute(f"SELECT id, LEFT(document, 200) AS snippet FROM {Q_CHUNKS} WHERE id IN ({ph})", tuple(c["_id"] for c in need))
+                snip = {r["id"]: r["snippet"] for r in await cur.fetchall()}
+                for c in need:
+                    c["snippet"] = snip.get(c["_id"], "")
+            for c in out:
+                c.pop("_id", None)
             # 5) 보여 준 조각을 events 에 기록
             if log_shown and top_n:
                 qsha = hashlib.sha1(query.encode("utf-8")).hexdigest()
@@ -431,6 +452,7 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                                          "prompt_sha1": qsha, "distance": c["distance"], "rank_no": c["rank"]} for c in out if c["shown"]])
     return {"results": out, "meta": {"total_ms": int((time.time() - t0) * 1000), "embed_ms": embed_ms,
                                       "per_source_fetched": per_src_count, "idents": [t for t, _ in idents],
+                                      "exact_memory": mem_rows is not None, "mem_rows": (MEM.n if MEM is not None else 0),
                                       "ident_rules_sha": IDENT_RULES_SHA}}
 
 
@@ -438,7 +460,12 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
 # MCP 등록 — server.register_tools() 에서 한 줄로 부른다
 # ---------------------------------------------------------------------------
 def register_atlas_tools(server, embedding_service) -> None:
+    global MEM
     mcp = server.mcp
+    if EXACT_MEMORY:
+        MEM = MemoryIndex(server, Q_CHUNKS, ATLAS_INSTANCE)
+        MEM.ensure_started()   # 이벤트 루프가 돌고 있으면 바로 적재 시작, 아니면 첫 검색 때 시작
+        logger.info(f"atlas: 메모리 정확 계산 켬 ({Q_CHUNKS})")
 
     @mcp.tool
     async def search_atlas(query: str, sources: Optional[List[str]] = None, per_source_n: int = 15, return_n: int = 10,
