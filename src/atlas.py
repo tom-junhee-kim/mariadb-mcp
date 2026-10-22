@@ -10,6 +10,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -32,6 +33,11 @@ INDEX_DEPTH = int(os.getenv("ATLAS_INDEX_DEPTH", "300"))
 IDENT_MAX_TOKENS = int(os.getenv("ATLAS_IDENT_MAX_TOKENS", "10"))   # 질의에서 정확 일치를 찾는 식별자 수
 IDENT_PER_TOKEN = int(os.getenv("ATLAS_IDENT_PER_TOKEN", "30"))      # 토큰마다 최신순으로 받는 조각 수
 EXACT_MEMORY = os.getenv("ATLAS_EXACT_MEMORY", "") == "1"
+# 순위식 C4(관련성 + 최근성): score = (1 − 거리) + γ·exp(−δ·경과일). 시간 항은 대화 턴에만 걸고 밀린 수집(burst) 턴은 0 이다.
+# 값은 사람 기준 판정 시험(reports/atlas-ranking-eval-20261023.md, 워크스페이스)에서 골랐다
+RANK_C4_GAMMA = float(os.getenv("ATLAS_RANK_C4_GAMMA", "0.3"))
+RANK_C4_DELTA = float(os.getenv("ATLAS_RANK_C4_DELTA", "0.01"))   # 하루당
+_DAY_MS = 86_400_000
 MEM: Optional[MemoryIndex] = None   # 인덱스에서 받는 후보 수(필터는 받은 뒤 파이썬에서 건다)
 T_CHUNKS = f"chunks{_SUFFIX}"
 T_IDENTS = f"chunk_idents{_SUFFIX}"
@@ -326,9 +332,12 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                        exclude_session_id: Optional[str] = None, exclude_after_line: Optional[int] = None,
                        machine: Optional[str] = None, project: Optional[str] = None, session_id: Optional[str] = None,
                        session_name: Optional[str] = None, log_shown: bool = True,
-                       instance_name: Optional[str] = None) -> Dict[str, Any]:
+                       instance_name: Optional[str] = None, rank: str = "distance",
+                       max_distance: Optional[float] = None) -> Dict[str, Any]:
     if not query or not isinstance(query, str):
         raise ValueError("query must be a non-empty string")
+    if rank not in ("distance", "c4"):
+        raise ValueError("rank must be 'distance' or 'c4'")
     srcs = list(sources) if sources else list(SOURCES)
     for s in srcs:
         _check_source(s)
@@ -434,15 +443,22 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                 else:
                     keep.append(c)
             keep.extend(folded.values())
-            # 4) 정렬: 식별자 일치 조각 먼저, 그다음 거리(C0: score = 1 − 거리). 순위식은 3단계 시험 뒤 여기에 들어온다.
+            # 4) 정렬: 식별자 일치 조각 먼저, 그다음 순위식(distance: 1 − 거리, c4: 위 RANK_C4_*)
+            ref_ms = int(before) if before is not None else int(time.time() * 1000)
             for c in keep:
-                c["score"] = round(1.0 - c["distance"], 6)
+                sc = 1.0 - c["distance"]
+                if rank == "c4" and c["source"] == "transcript" and c.get("turn_at_source") != "burst":
+                    age_d = max(0.0, (ref_ms - int(c["item_at"])) / _DAY_MS) if c.get("item_at") is not None else 0.0
+                    sc += RANK_C4_GAMMA * math.exp(-RANK_C4_DELTA * age_d)
+                c["score"] = round(sc, 6)
             keep.sort(key=lambda c: (0 if c["cand_from"] in ("ident", "both") else 1,
-                                     -ident_w.get((c["source"], c["origin_key"], c["chunk_no"]), 0.0), c["distance"]))
+                                     -ident_w.get((c["source"], c["origin_key"], c["chunk_no"]), 0.0), -c["score"], c["distance"]))
             out = keep[:return_n]
             for i, c in enumerate(out):
                 c["rank"] = i + 1
-                c["shown"] = i < top_n
+                # 보여 줄 것은 상위 top_n 을 자른 뒤 거리 상한으로 거른다(식별자 일치는 상한을 건너뛴다) — 시험과 같은 순서
+                c["shown"] = i < top_n and (max_distance is None or c["cand_from"] in ("ident", "both")
+                                            or c["distance"] <= float(max_distance))
             # 4-2) 메모리 경로의 후보는 본문 앞부분(snippet)을 상위 후보만 DB 에서 읽어 채운다
             need = [c for c in out if c.get("snippet") is None and c.get("_id")]
             if need:
@@ -482,11 +498,12 @@ def register_atlas_tools(server, embedding_service) -> None:
                                 exclude_after_line: Optional[int] = None, machine: Optional[str] = None,
                                 project: Optional[str] = None, session_id: Optional[str] = None,
                                 session_name: Optional[str] = None, log_shown: bool = True,
-                                instance_name: Optional[str] = None) -> Dict[str, Any]:
-        """Search the memory atlas (transcripts, auto-memory, workspace memory, machine docs) by meaning plus exact identifiers (commit hash, path, board no)."""
+                                instance_name: Optional[str] = None, rank: str = "distance",
+                                max_distance: Optional[float] = None) -> Dict[str, Any]:
+        """Search the memory atlas (transcripts, auto-memory, workspace memory, machine docs) by meaning plus exact identifiers (commit hash, path, board no). rank='c4' adds recency for transcripts; max_distance limits which of the top_n are marked shown."""
         return await do_search(server, embedding_service, query, sources, per_source_n, return_n, top_n, before,
                                   exclude_session_id, exclude_after_line, machine, project, session_id, session_name,
-                                  log_shown, instance_name)
+                                  log_shown, instance_name, rank, max_distance)
 
     @mcp.tool
     async def get_atlas(source: str, origin_key: str, chunk_no: Optional[int] = None, record_open: bool = True,
