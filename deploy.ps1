@@ -171,7 +171,7 @@ if (-not (Test-Remote "bash $RemoteDir/run.sh $Name $Port $Image")) {
     Invoke-Rollback
 }
 
-# 5. healthy 대기 (최대 300초, 5초 간격). unless-stopped 라 죽어도 다시 뜨므로 Running 은 판정에 못 쓴다.
+# 5. healthy 대기 (최대 300초, 5초 간격). on-failure 라 오류로 죽어도 다시 뜨므로 Running 은 판정에 못 쓴다.
 #    RestartCount 가 2를 넘으면 크래시 루프로 보고 바로 롤백한다.
 Write-Host "==> health 대기 (최대 300초)"
 $healthy = $false

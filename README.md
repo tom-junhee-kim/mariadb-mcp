@@ -8,7 +8,7 @@ MariaDB MCP 서버. instances.json으로 멀티 인스턴스를 단일 컨테이
 - **이미지**: `codescent/mariadb-mcp:latest` + 커밋 태그 `codescent/mariadb-mcp:<sha>` (커스텀 — python:3.11.15-slim + uv 0.11.31, 의존성은 `uv.lock` 고정)
 - **컨테이너**: `mariadb-mcp`
 - **네트워크**: bridge (9001)
-- **재시작 정책**: unless-stopped
+- **재시작 정책**: on-failure — 부팅 때 순서는 서버의 boot-order 서비스가 띄운다(codescent-claude-workspace `.claude/toolkit/boot-order`)
 
 ## 파일 구조
 

@@ -14,7 +14,7 @@ IMAGE="${3:-codescent/mariadb-mcp:latest}"
 docker run -d \
   --name "$NAME" \
   -h "$NAME" \
-  --restart unless-stopped \
+  --restart on-failure \
   --add-host=host.docker.internal:host-gateway \
   --env-file "$DIR/.env" \
   --log-opt max-size=10m \
