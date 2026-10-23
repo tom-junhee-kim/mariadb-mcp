@@ -32,6 +32,7 @@ import anyio
 from fastmcp import FastMCP, Context
 
 # Import custom connection pool that disables MULTI_STATEMENTS
+from sql_guard import ensure_single_statement
 from custom_connection import create_safe_pool
 
 from starlette.middleware import Middleware
@@ -241,6 +242,7 @@ class MariaDBServer:
 
     async def _execute_query(self, sql: str, params: Optional[tuple] = None, database: Optional[str] = None, instance_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Helper function to execute queries using the pool for the given instance."""
+        ensure_single_statement(sql)
         pool = await self._get_pool(instance_name)
         instance_db = self._get_instance_db(instance_name)
 
