@@ -106,6 +106,7 @@ async def main():
             wsname = f"t-ws-{TAG}"
             p = await tool(s, "put_doc", kind="rule", scope="ws:codescent", name=wsname, body="ws 규칙", base_version=0, reason="ws", header={})
             await tool(s, "decide_proposal", proposal_id=p["proposal_id"], decision="approve", approval_quote="ws 승인", test_sha=p["content_sha"])
+            await tool(s, "set_cutover", workspace="codescent", machine="isD-MacBookPro", mode="file", approval_quote="시험 시작 상태")
             rr3 = get(f"/atlas/rules?ws=codescent&machine=isD-MacBookPro&nonce=x3")
             check("전환 표지 file → ws 규칙 빠짐", rr3["ws_mode"] == "file" and f"rule:ws:codescent:{wsname}" not in {x["doc_id"] for x in rr3["rules"]})
             await tool(s, "set_cutover", workspace="codescent", machine="isD-MacBookPro", mode="db", approval_quote="전환 승인")
@@ -172,6 +173,33 @@ async def main():
             check("rule_stats 응답", "docs" in rs)
             mv = await tool(s, "move_doc", doc_id=did, to_scope="ws:codescent", reason="이동 시험")
             check("move_doc → 후보", mv.get("status") == "proposed")
+
+            # 12) /atlas/docs — 열람 기록 없이 일괄 읽기, etag 는 판이 바뀔 때만 바뀜
+            mdid = f"machine_doc:machine:isD-MacBookPro:m-{TAG}"
+            cnt_sql = "SELECT COUNT(*) AS n FROM memory_atlas.events_test WHERE event='opened' AND ref_origin_key=%s"
+            before = (await tool(s, "execute_sql", sql_query=cnt_sql, database_name="memory_atlas", parameters=[mdid]))
+            d1 = get(f"/atlas/docs?kinds=machine_doc&scopes=global,machine:isD-MacBookPro&nonce=d1")
+            d2 = get(f"/atlas/docs?kinds=machine_doc&scopes=global,machine:isD-MacBookPro&nonce=d2")
+            after = (await tool(s, "execute_sql", sql_query=cnt_sql, database_name="memory_atlas", parameters=[mdid]))
+            ids = {x["doc_id"] for x in d1.get("docs", [])}
+            check("/atlas/docs: 요청 범위 문서가 본문과 함께 옴·다른 머신 범위는 안 옴",
+                  mdid in ids and not any(x.startswith("machine_doc:machine:CS-15S-EQ3") for x in ids)
+                  and all(x.get("body") is not None for x in d1["docs"]), f"count={d1.get('count')}")
+            check("/atlas/docs: echo = nonce", d1.get("echo") == "d1" and d2.get("echo") == "d2")
+            check("/atlas/docs: 판이 같으면 etag 같음", d1.get("etag") == d2.get("etag"))
+            num = lambda r: r[0]["n"] if isinstance(r, list) and r and isinstance(r[0].get("n"), int) else None
+            check("/atlas/docs: opened 를 남기지 않음", num(before) is not None and num(before) == num(after), f"{before} → {after}")
+            await tool(s, "get_doc", doc_id=mdid)
+            after2 = (await tool(s, "execute_sql", sql_query=cnt_sql, database_name="memory_atlas", parameters=[mdid]))
+            check("대조군: get_doc 은 opened 를 남김", num(after) is not None and num(after2) == num(after) + 1, f"{after} → {after2}")
+            await tool(s, "put_doc", kind="machine_doc", scope="machine:isD-MacBookPro", name=f"m-{TAG}", body="자기 머신 문서 2판",
+                       base_version=1, reason="판 올림")
+            d3 = get(f"/atlas/docs?kinds=machine_doc&scopes=global,machine:isD-MacBookPro&nonce=d3")
+            check("/atlas/docs: 판이 바뀌면 etag 바뀜", d3.get("etag") != d1.get("etag"))
+            try:
+                urllib.request.urlopen(BASE + "/atlas/docs?kinds=bogus&scopes=global&nonce=z", timeout=5); check("틀린 kind → 400", False)
+            except urllib.error.HTTPError as e:
+                check("틀린 kind → 400", e.code == 400)
 
     print(f"시험 {len(RESULTS)}개 중 실패 {RESULTS.count(False)}개")
     sys.exit(1 if False in RESULTS else 0)

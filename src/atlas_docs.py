@@ -700,6 +700,29 @@ async def http_rules(server, ws: Optional[str], machine: Optional[str], since: O
     return {"echo": nonce, "rules_version": rv, "ws_mode": ws_mode, "unchanged": False, "rules": rules}
 
 
+async def http_docs(server, kinds: List[str], scopes: List[str], nonce: str) -> Dict[str, Any]:
+    """호스트 스크립트(머신 문서 로컬 사본·CLAUDE.md 생성)용 일괄 읽기. `get_doc` 과 달리 `opened` 를 남기지 않는다 —
+    판이 바뀔 때마다 4대가 읽으면 사람·세션의 열람 신호가 묻히므로. `etag` 는 (doc_id, 판) 목록의 해시라 바뀌지 않았으면 쓰지 않게 한다."""
+    for k in kinds:
+        _check_kind(k)
+    for s in scopes:
+        _check_scope(s)
+    if not kinds or not scopes:
+        raise ValueError("kinds and scopes are required")
+    kph, sph = ",".join(["%s"] * len(kinds)), ",".join(["%s"] * len(scopes))
+    async with _tx(server) as cur:
+        await cur.execute(f"SELECT %s AS echo, doc_id, kind, scope, name, version, header, body, body_sha, updated_at FROM {Q_DOCS} "
+                          f"WHERE status='active' AND kind IN ({kph}) AND scope IN ({sph}) ORDER BY kind, scope, name",
+                          tuple([nonce] + kinds + scopes))
+        rows = await cur.fetchall()
+    if any(r["echo"] != nonce for r in rows):
+        raise RuntimeError("echo mismatch — DB connection returned another query's result")
+    docs = [{"doc_id": r["doc_id"], "kind": r["kind"], "scope": r["scope"], "name": r["name"], "version": int(r["version"]),
+             "header": _json(r["header"]), "body": r["body"], "body_sha": r["body_sha"], "updated_at": str(r["updated_at"])} for r in rows]
+    etag = hashlib.sha256("\n".join(f"{d['doc_id']}@{d['version']}" for d in docs).encode("utf-8")).hexdigest()[:16]
+    return {"echo": nonce, "etag": etag, "count": len(docs), "docs": docs}
+
+
 def register_docs(server, embedding_service) -> None:
     global STATE, EMB
     mcp = server.mcp
@@ -734,6 +757,22 @@ def register_docs(server, embedding_service) -> None:
             return JSONResponse(await http_rules(server, qp.get("ws"), qp.get("machine"), since, nonce))
         except Exception as e:  # noqa: BLE001
             logger.error(f"atlas docs: /atlas/rules 실패: {e}")
+            return JSONResponse({"error": str(e)[:200]}, status_code=503)
+
+    @mcp.custom_route("/atlas/docs", methods=["GET"])
+    async def atlas_docs(request: Request):
+        qp = request.query_params
+        nonce = qp.get("nonce")
+        if not nonce or len(nonce) > 64:
+            return JSONResponse({"error": "nonce is required (1..64 chars)"}, status_code=400)
+        try:
+            kinds = [k for k in (qp.get("kinds") or "").split(",") if k]
+            scopes = [s for s in (qp.get("scopes") or "").split(",") if s]
+            return JSONResponse(await http_docs(server, kinds, scopes, nonce))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)[:200]}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"atlas docs: /atlas/docs 실패: {e}")
             return JSONResponse({"error": str(e)[:200]}, status_code=503)
 
     @mcp.custom_route("/atlas/search", methods=["POST"])
