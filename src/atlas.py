@@ -45,7 +45,9 @@ T_EVENTS = f"events{_SUFFIX}"
 Q_CHUNKS = f"`{ATLAS_DB}`.`{T_CHUNKS}`"
 Q_IDENTS = f"`{ATLAS_DB}`.`{T_IDENTS}`"
 Q_EVENTS = f"`{ATLAS_DB}`.`{T_EVENTS}`"
-SOURCES = ("transcript", "auto_memory", "workspace_memory", "machine_doc")
+SOURCES = ("transcript", "auto_memory", "workspace_memory", "machine_doc")   # sources 를 주지 않은 검색이 찾는 종류
+# 규칙·CLAUDE.md 절(atlas_docs.py 가 docs 표에서 조각을 만든다). 기본 검색에 섞지 않고 sources 로 명시할 때만 찾는다
+ALL_SOURCES = SOURCES + ("rule", "guide")
 EMBED_MODEL_TAG = os.getenv("ATLAS_EMBED_MODEL_TAG", "bge-m3-korean/1024")   # 저장 행의 metadata.embed_model
 _QP = os.getenv("ATLAS_QUERY_PREFIX", "").strip()   # 질의 임베딩 앞에 붙이는 접두어(arctic-embed 는 "query:"). env-file 은 값 끝 공백을 보존하지 않으므로 공백 한 칸은 코드가 붙인다
 QUERY_PREFIX = _QP + " " if _QP else ""   # 임베딩 서버가 이 접두어("query: ")로 질의를 알아본다
@@ -90,8 +92,8 @@ def extract_idents(text: str) -> List[Tuple[str, str]]:
 # 공통 도우미
 # ---------------------------------------------------------------------------
 def _check_source(source: str) -> None:
-    if source not in SOURCES:
-        raise ValueError(f"source must be one of {SOURCES}: {source!r}")
+    if source not in ALL_SOURCES:
+        raise ValueError(f"source must be one of {ALL_SOURCES}: {source!r}")
 
 
 def _check_key(origin_key: str) -> None:
@@ -519,3 +521,6 @@ def register_atlas_tools(server, embedding_service) -> None:
         return await do_add(server, embedding_service, source, origin_key, chunks, only_if_newer, instance_name)
 
     logger.info("Registered atlas tools: search_atlas, get_atlas, add_atlas")
+
+    from atlas_docs import register_docs   # 10단계: 규칙·문서 정본 도구와 훅 전용 경로
+    register_docs(server, embedding_service)

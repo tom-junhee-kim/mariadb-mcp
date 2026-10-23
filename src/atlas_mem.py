@@ -13,7 +13,7 @@ import numpy as np
 from config import logger
 
 DIM = 1024
-SRC_CODES = {"transcript": 0, "auto_memory": 1, "workspace_memory": 2, "machine_doc": 3}
+SRC_CODES = {"transcript": 0, "auto_memory": 1, "workspace_memory": 2, "machine_doc": 3, "rule": 4, "guide": 5}
 REFRESH_SEC = float(os.getenv("ATLAS_MEM_REFRESH_SEC", "30"))
 RECONCILE_SEC = float(os.getenv("ATLAS_MEM_RECONCILE_SEC", "300"))
 RETRY_SEC = 30.0
