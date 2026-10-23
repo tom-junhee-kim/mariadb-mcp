@@ -56,6 +56,7 @@ class SafePool(Pool):
     async def fill_free_pool(self, override_min: bool = False):
         """
         Override fill_free_pool to use safe_connect instead of connect.
+        asyncmy 0.2.16 의 본문을 그대로 옮기고 연결 생성만 바꿨다 — asyncmy 판을 바꾸면 이 본문도 그 판에 맞춘다(pyproject 에서 판 고정).
         
         This is the method that creates new connections for the pool.
         """
@@ -64,12 +65,15 @@ class SafePool(Pool):
         n = 0
         while n < free_size:
             conn = self._free[-1]
-            if conn._reader.at_eof() or conn._reader.exception():
+            if conn._stream_broken:
                 self._free.pop()
                 conn.close()
             elif self._recycle > -1 and self._loop.time() - conn.last_usage > self._recycle:
                 self._free.pop()
-                conn.close()
+                try:
+                    await conn.ensure_closed()
+                except Exception:
+                    conn.close()
             else:
                 self._free.rotate()
             n += 1
@@ -79,9 +83,10 @@ class SafePool(Pool):
             try:
                 conn = await safe_connect(**self._conn_kwargs)
                 self._free.append(conn)
-                self._cond.notify()
             finally:
+                # connect 가 실패해도 기다리는 쪽을 깨워야 size 변화를 본다
                 self._acquiring -= 1
+                self._cond.notify()
         if self._free:
             return
 
@@ -90,9 +95,9 @@ class SafePool(Pool):
             try:
                 conn = await safe_connect(**self._conn_kwargs)
                 self._free.append(conn)
-                self._cond.notify()
             finally:
                 self._acquiring -= 1
+                self._cond.notify()
 
 
 def create_safe_pool(

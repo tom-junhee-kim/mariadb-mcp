@@ -5,7 +5,7 @@ description = "MariaDB MCP Server"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "asyncmy>=0.2.10",
+    "asyncmy==0.2.16",
     "fastmcp[websockets]==2.12.1",
     "google-genai>=1.15.0",
     "numpy>=1.24.0",
@@ -17,3 +17,4 @@ dependencies = [
 [tool.uv]
 # uv.lock is resolved as of the 2026-04-19 production image build; move this forward with `uv lock --upgrade` to take newer releases.
 exclude-newer = "2026-04-19T03:06:19Z"
+exclude-newer-package = { asyncmy = "2026-10-07T00:00:00Z" }
