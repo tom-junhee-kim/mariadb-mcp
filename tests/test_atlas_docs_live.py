@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import os
 import secrets
 import sys
 import time
@@ -16,6 +17,8 @@ from mcp.client.sse import sse_client
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:19001"
 TAG = secrets.token_hex(3)
 RESULTS = []
+TOKEN = os.environ.get("ATLAS_TEST_TOKEN")   # 서버가 파이프라인 도구에 토큰을 요구하면(운영 꼴) 시험 코드가 붙인다
+PIPELINE_TOOLS = ("import_docs", "add_rule_events", "set_tuning", "open_proposal")
 
 
 def check(name, ok, detail=""):
@@ -29,6 +32,8 @@ def get(path):
 
 
 async def tool(s, _tool, **args):
+    if TOKEN and _tool in PIPELINE_TOOLS and "token" not in args:
+        args["token"] = TOKEN
     r = await s.call_tool(_tool, args)
     t = r.content[0].text
     if r.isError:
@@ -155,6 +160,16 @@ async def main():
             r1 = await tool(s, "import_docs", rows=rows, by="test")
             r2 = await tool(s, "import_docs", rows=rows, by="test")
             check("import_docs: 처음 written, 다시 unchanged", r1["counts"]["written"] == 1 and r2["counts"]["unchanged"] == 1, f"{r1['counts']} {r2['counts']}")
+            if TOKEN:   # 서버가 토큰을 요구하는 구성 — 없음·틀림은 거부되고 어떤 행도 쓰이지 않는다
+                rows_t = [{"kind": "rule", "scope": "global", "name": f"tok-{TAG}", "header": {"x": 1}, "body": "토큰 시험"}]
+                for label, tk in (("토큰 없음", None), ("틀린 토큰", "wrong-" + TOKEN[:6])):
+                    a = {"rows": rows_t, "by": "test"}
+                    if tk:
+                        a["token"] = tk
+                    r = await s.call_tool("import_docs", a)
+                    check(f"파이프라인 도구: {label} → 거부", r.isError and "token" in r.content[0].text.lower(), r.content[0].text[:80])
+                gone = await tool(s, "get_doc", doc_id=f"rule:global:tok-{TAG}")
+                check("거부된 호출은 아무 행도 쓰지 않음", gone.get("found") is False)
 
             # 10) 상시 승인 — 범위 안 후보만
             p1 = await tool(s, "put_doc", kind="machine_doc", scope="global", name=f"sa-{TAG}", body="상시1", base_version=0, reason="상시")
