@@ -2,7 +2,7 @@
 #
 # 표(sql/atlas_docs.sql): docs · docs_history · doc_proposals · rule_events · tuning · ws_cutover · standing_approvals
 # 세션 도구 : list_docs · get_doc · put_doc · move_doc · diff_rules · rule_stats · add_standing_approval · set_cutover · decide_proposal
-# 파이프라인 도구(세션에서는 managed deny 로 숨김): import_docs · add_rule_events · set_tuning · open_proposal
+# 파이프라인 도구(세션에서는 managed deny 로 숨김): import_docs · add_rule_events · set_rule_reactions · set_tuning · open_proposal
 # 훅 전용 HTTP 경로: GET /atlas/version · GET /atlas/rules · POST /atlas/search
 #
 # 규칙(rule)·CLAUDE.md 절(guide)은 언제나 후보(doc_proposals)를 거쳐 사람 승인 뒤에만 바뀐다. 사람 턴 대조는 클라이언트(gate)가 하고,
@@ -628,6 +628,21 @@ async def do_add_rule_events(server, rows: List[Dict[str, Any]]) -> Dict[str, An
     return {"inserted": n, "given": len(rows)}
 
 
+REACTIONS = ("changed", "checked-rerun", "instant-rerun", "none")
+
+
+async def do_set_rule_reactions(server, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """판정 뒤의 반응을 채운다. 비어 있는 행만 바꾸므로(이미 채운 행은 그대로) 같은 계산을 다시 보내도 값이 흔들리지 않는다."""
+    n = 0
+    async with _tx(server) as cur:
+        for r in rows:
+            if r.get("reaction") not in REACTIONS:
+                raise ValueError(f"reaction must be one of {REACTIONS}")
+            await cur.execute(f"UPDATE {Q_RULEEV} SET reaction=%s WHERE event_uid=%s AND reaction IS NULL", (r["reaction"], r["event_uid"]))
+            n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return {"updated": n, "given": len(rows)}
+
+
 async def do_set_tuning(server, k: str, v: float, reason: str) -> Dict[str, Any]:
     if not reason:
         raise ValueError("reason is required")
@@ -854,6 +869,12 @@ def register_docs(server, embedding_service) -> None:
         """(pipeline only) Load rule hook decision rows (deduplicated by event_uid)."""
         _check_token(token)
         return await do_add_rule_events(server, rows)
+
+    @mcp.tool
+    async def set_rule_reactions(rows: List[Dict[str, Any]], token: Optional[str] = None) -> Dict[str, Any]:
+        """(pipeline only) Fill the reaction column of rule hook decision rows (only rows still empty)."""
+        _check_token(token)
+        return await do_set_rule_reactions(server, rows)
 
     @mcp.tool
     async def set_tuning(k: str, v: float, reason: str, token: Optional[str] = None) -> Dict[str, Any]:

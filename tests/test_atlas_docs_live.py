@@ -18,7 +18,7 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:19001"
 TAG = secrets.token_hex(3)
 RESULTS = []
 TOKEN = os.environ.get("ATLAS_TEST_TOKEN")   # 서버가 파이프라인 도구에 토큰을 요구하면(운영 꼴) 시험 코드가 붙인다
-PIPELINE_TOOLS = ("import_docs", "add_rule_events", "set_tuning", "open_proposal")
+PIPELINE_TOOLS = ("import_docs", "add_rule_events", "set_rule_reactions", "set_tuning", "open_proposal")
 
 
 def check(name, ok, detail=""):
@@ -170,6 +170,28 @@ async def main():
                     check(f"파이프라인 도구: {label} → 거부", r.isError and "token" in r.content[0].text.lower(), r.content[0].text[:80])
                 gone = await tool(s, "get_doc", doc_id=f"rule:global:tok-{TAG}")
                 check("거부된 호출은 아무 행도 쓰지 않음", gone.get("found") is False)
+
+            # 9-2) 판정 뒤 반응 채우기 — 비어 있는 행만 바뀌고, 이미 채운 행·틀린 값은 그대로/거부
+            ev_rows = [{"at": "2026-10-25 00:00:00", "machine": "isD-MacBookPro", "session_id": f"{TAG}-0000-0000-0000-000000000000", "event_name": "PreToolUse",
+                        "tool": "Bash", "doc_id": "rule:global:t", "decision": "deny-once", "subject_sha": "aaaaaaaa", "input_sha": f"{i:08x}",
+                        "event_uid": f"{TAG}-{i}".ljust(40, "0")} for i in range(3)]
+            await tool(s, "add_rule_events", rows=ev_rows)
+            q_re = f"SELECT reaction FROM memory_atlas.rule_events_test WHERE event_uid=%s"
+            rr = await tool(s, "set_rule_reactions", rows=[{"event_uid": ev_rows[0]["event_uid"], "reaction": "instant-rerun"},
+                                                          {"event_uid": ev_rows[1]["event_uid"], "reaction": "changed"}])
+            check("set_rule_reactions: 비어 있는 행 2개를 채움", rr.get("updated") == 2, str(rr))
+            rr2 = await tool(s, "set_rule_reactions", rows=[{"event_uid": ev_rows[0]["event_uid"], "reaction": "changed"},
+                                                           {"event_uid": ev_rows[2]["event_uid"], "reaction": "none"}])
+            check("set_rule_reactions: 이미 채운 행은 그대로(1개만 갱신)", rr2.get("updated") == 1, str(rr2))
+            v0r = await tool(s, "execute_sql", sql_query=q_re, database_name="memory_atlas", parameters=[ev_rows[0]["event_uid"]])
+            check("이미 채운 값이 바뀌지 않음(instant-rerun 유지)", v0r and v0r[0].get("reaction") == "instant-rerun", str(v0r))
+            bad = await s.call_tool("set_rule_reactions", {"rows": [{"event_uid": ev_rows[2]["event_uid"], "reaction": "bogus"}], **({"token": TOKEN} if TOKEN else {})})
+            check("set_rule_reactions: 틀린 반응 값은 거부", bad.isError and "reaction" in bad.content[0].text, bad.content[0].text[:80])
+            if TOKEN:
+                nt = await s.call_tool("set_rule_reactions", {"rows": [{"event_uid": ev_rows[2]["event_uid"], "reaction": "changed"}]})
+                check("set_rule_reactions: 토큰 없음 → 거부", nt.isError and "token" in nt.content[0].text.lower())
+            rs2 = await tool(s, "rule_stats", doc_id="rule:global:t", days=3650)
+            check("rule_stats 가 채운 반응을 셈", rs2["docs"].get("rule:global:t", {}).get("reactions", {}).get("instant-rerun", 0) >= 1, str(rs2["docs"].get("rule:global:t")))
 
             # 10) 상시 승인 — 범위 안 후보만
             p1 = await tool(s, "put_doc", kind="machine_doc", scope="global", name=f"sa-{TAG}", body="상시1", base_version=0, reason="상시")
