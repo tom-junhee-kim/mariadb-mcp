@@ -671,9 +671,11 @@ async def do_rule_stats(server, doc_id: Optional[str] = None, days: int = 7) -> 
 # 파이프라인 도구
 # ---------------------------------------------------------------------------
 async def do_import_docs(server, rows: List[Dict[str, Any]], by: str) -> Dict[str, Any]:
-    """파일에서 가져온 판을 바로 쓴다(후보를 거치지 않음). 본문·머리가 같으면 건너뛴다."""
-    counts = {"written": 0, "unchanged": 0, "error": 0}
+    """파일에서 가져온 판을 바로 쓴다(후보를 거치지 않음). 본문·머리가 같으면 건너뛴다.
+    가져오기가 아닌 경로(put_doc·decide_proposal)로 쓰인 판은 덮지 않는다 — 정본이 DB 로 넘어간 뒤의 편집을 동결된 파일 판이 되돌리지 않게."""
+    counts = {"written": 0, "unchanged": 0, "kept_db": 0, "error": 0}
     errors = []
+    kept = []
     changed_rules = False
     async with _tx(server) as cur:
         for r in rows:
@@ -682,11 +684,15 @@ async def do_import_docs(server, rows: List[Dict[str, Any]], by: str) -> Dict[st
                 _check_kind(kind); _check_scope(scope); _check_name(name)
                 header, body = r.get("header") or {}, r.get("body") or ""
                 did = doc_id_of(kind, scope, name)
-                await cur.execute(f"SELECT header, body_sha, status FROM {Q_DOCS} WHERE doc_id=%s", (did,))
+                await cur.execute(f"SELECT header, body_sha, status, updated_by FROM {Q_DOCS} WHERE doc_id=%s", (did,))
                 old = await cur.fetchone()
                 sha = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
                 if old and old["body_sha"] == sha and (_json(old["header"]) or {}) == header and old["status"] == "active":
                     counts["unchanged"] += 1
+                    continue
+                if old and not str(old["updated_by"] or "").endswith("/import"):
+                    counts["kept_db"] += 1
+                    kept.append(did)
                     continue
                 await _write_doc(cur, kind, scope, name, header, body, "active", by, r.get("reason") or "import", None)
                 counts["written"] += 1
@@ -697,7 +703,7 @@ async def do_import_docs(server, rows: List[Dict[str, Any]], by: str) -> Dict[st
         rv = await _bump(cur, "rules_version") if changed_rules else None
     if rv is not None:
         _state_touch(rules=rv)
-    return {"counts": counts, "errors": errors[:20], "rules_version": rv}
+    return {"counts": counts, "errors": errors[:20], "kept_db": kept[:200], "rules_version": rv}
 
 
 async def do_add_rule_events(server, rows: List[Dict[str, Any]]) -> Dict[str, Any]:

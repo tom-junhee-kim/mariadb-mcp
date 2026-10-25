@@ -124,7 +124,7 @@ async def main():
                 check("nonce 없는 요청 → 400", e.code == 400)
 
             # 7) 조각 맞추기(rule·guide) — 기본 검색에는 섞이지 않고 sources 로만
-            for _ in range(20):
+            for _ in range(60):
                 g = await tool(s, "get_atlas", source="rule", origin_key=did, record_open=False)
                 if g.get("found"):
                     break
@@ -237,6 +237,21 @@ async def main():
                 urllib.request.urlopen(BASE + "/atlas/docs?kinds=bogus&scopes=global&nonce=z", timeout=5); check("틀린 kind → 400", False)
             except urllib.error.HTTPError as e:
                 check("틀린 kind → 400", e.code == 400)
+
+            # 13) 가져오기는 가져오기가 아닌 경로(put_doc)로 쓰인 판을 덮지 않는다
+            nm = f"imp-guard-{TAG}"
+            did2 = f"machine_doc:machine:isD-MacBookPro:{nm}"
+            await tool(s, "put_doc", kind="machine_doc", scope="machine:isD-MacBookPro", name=nm, body="DB 에서 고친 판", base_version=0, reason="시험")
+            row = {"kind": "machine_doc", "scope": "machine:isD-MacBookPro", "name": nm, "header": {}, "body": "파일에서 온 옛 판"}
+            ri = await tool(s, "import_docs", rows=[row], by="isD-MacBookPro/import")
+            gd = await tool(s, "get_doc", doc_id=did2)
+            check("가져오기: put_doc 으로 쓴 판은 유지(kept_db)·본문 그대로", ri["counts"].get("kept_db") == 1 and gd.get("body") == "DB 에서 고친 판" and did2 in ri.get("kept_db", []), str(ri["counts"]))
+            nm3 = f"imp-keep-{TAG}"
+            row3 = {"kind": "machine_doc", "scope": "machine:isD-MacBookPro", "name": nm3, "header": {}, "body": "가져온 1판"}
+            await tool(s, "import_docs", rows=[row3], by="isD-MacBookPro/import")
+            r3 = await tool(s, "import_docs", rows=[dict(row3, body="가져온 2판")], by="isD-MacBookPro/import")
+            g3 = await tool(s, "get_doc", doc_id=f"machine_doc:machine:isD-MacBookPro:{nm3}")
+            check("대조군: 가져오기가 쓴 판은 다음 가져오기가 갱신", r3["counts"]["written"] == 1 and g3.get("body") == "가져온 2판" and r3["counts"].get("kept_db") == 0, str(r3["counts"]))
 
     print(f"시험 {len(RESULTS)}개 중 실패 {RESULTS.count(False)}개")
     sys.exit(1 if False in RESULTS else 0)
