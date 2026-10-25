@@ -19,8 +19,9 @@ from mcp.client.sse import sse_client  # noqa: E402
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:19001"
 TAG = secrets.token_hex(3)
 TOKEN = os.environ.get("ATLAS_TEST_TOKEN")
-PIPELINE_TOOLS = ("add_atlas", "import_docs")
+PIPELINE_TOOLS = ("import_docs",)
 RESULTS = []
+INERT_WAIT = int(os.environ.get("INERT_WAIT_SEC", "75"))   # 비활성 확인은 맞춤 주기를 두 번 이상 지나야 뜻이 있다(시험 서버 주기는 30초 안팎)
 WAIT = 240   # 시험 표에 가져와 둔 다른 문서도 전환 범위 안이면 함께 맞춰지므로 넉넉히 기다린다(초)
 
 
@@ -33,6 +34,8 @@ async def tool(s, _tool, **args):
     if TOKEN and _tool in PIPELINE_TOOLS and "token" not in args:
         args["token"] = TOKEN
     r = await s.call_tool(_tool, args)
+    if not r.content:   # 행 0건인 SELECT 는 내용이 비어 온다
+        return [] if _tool == "execute_sql" else {}
     t = r.content[0].text
     if r.isError:
         return {"_error": t}
@@ -78,6 +81,11 @@ async def main():
     async with sse_client(BASE + "/sse", timeout=10) as (rd, wr):
         async with ClientSession(rd, wr) as s:
             await s.initialize()
+            # 앞선 실행이 중간에 멈춰 남긴 시험 행을 먼저 쓸어낸다
+            await sql(s, "DELETE FROM chunk_idents_test WHERE origin_key LIKE '%zz-chunk-%' OR origin_key LIKE '%zz-g-%' OR origin_key LIKE '%zz-mem-%'")
+            await sql(s, "DELETE FROM chunks_test WHERE origin_key LIKE '%zz-chunk-%' OR origin_key LIKE '%zz-g-%' OR origin_key LIKE '%zz-mem-%'")
+            await sql(s, "DELETE FROM ws_cutover_test WHERE workspace LIKE 'zzws%' OR (workspace='@machine_doc' AND machine IN (%s,'global'))", [host])
+            await sql(s, "DELETE FROM docs_test WHERE name LIKE 'zz-chunk-%' OR name LIKE 'zz-g-%' OR name LIKE 'zz-mem-%'")
             name = f"zz-chunk-{TAG}"
             lk = f"{host}:{name}.md"
             doc_id = f"machine_doc:machine:{host}:{name}"
@@ -89,10 +97,14 @@ async def main():
             r = await tool(s, "put_doc", kind="machine_doc", scope=f"machine:{host}", name=name, body=BODY1.format(t=TAG), base_version=0,
                            reason="시험", header={"legacy_origin_key": lk, "file": f"{name}.md"})
             check("put_doc → 바로 씀", r.get("status") == "written" and r.get("version") == 1, str(r)[:100])
+            done_sql = "SELECT COUNT(*) n FROM docs_test WHERE kind IN ('machine_doc','workspace_memory') AND chunk_version = version"
             before = await rows(s, ("machine_doc", f"{lk}%"))
-            await asyncio.sleep(7)   # 맞춤 주기 두세 번
+            n_before = (await sql(s, done_sql))[0]["n"]
+            await asyncio.sleep(INERT_WAIT)
             after = await rows(s, ("machine_doc", f"{lk}%"))
+            n_after = (await sql(s, done_sql))[0]["n"]
             check("전환 표지 없음 → 옛 조각 그대로(행 id·본문 같음)", before == after and len(after) == 3, f"{len(before)}→{len(after)}")
+            check("전환 표지 없음 → 파일 종류 문서를 하나도 맞추지 않음(대기 중인 다른 문서 포함)", n_before == n_after, f"{n_before}→{n_after}")
             cv = await sql(s, "SELECT version, chunk_version FROM docs_test WHERE doc_id=%s", [doc_id])
             check("전환 표지 없음 → chunk_version 도 그대로(판과 다름)", cv and cv[0]["chunk_version"] != cv[0]["version"], str(cv))
 
@@ -137,7 +149,7 @@ async def main():
             p = await tool(s, "put_doc", kind="machine_doc", scope="global", name=gname, body="## 전역 절\n전역 본문.\n", base_version=0, reason="시험",
                            header={"legacy_origin_key": f"{host}:{gname}.md", "file": f"{gname}.md"})
             await tool(s, "decide_proposal", proposal_id=p["proposal_id"], decision="approve", approval_quote="시험 승인")
-            await asyncio.sleep(6)
+            await asyncio.sleep(INERT_WAIT)
             g_before = await rows(s, ("machine_doc", f"%:{gname}.md#%"))
             check("전역 문서도 표지 없으면 옛 사본 둘 그대로", len(g_before) == 2 and all(x["fh"] == "legacyhash0000" for x in g_before), str(len(g_before)))
             await tool(s, "set_cutover", workspace="@machine_doc", machine="global", mode="db", approval_quote="전역 전환")
@@ -165,7 +177,7 @@ async def main():
                        reason="시험", header={"legacy_origin_key": wkey}, caller_ws=ws)
             await tool(s, "set_cutover", workspace=ws, machine=host, mode="db", approval_quote="한 머신만")
             await tool(s, "set_cutover", workspace=ws, machine="CS-15S-EQ3", mode="file", approval_quote="다른 머신은 아직")
-            await asyncio.sleep(6)
+            await asyncio.sleep(INERT_WAIT)
             w1 = await rows(s, ("workspace_memory", wkey))
             check("한 머신이라도 file 이면 서버가 안 만듦(옛 조각 그대로)", len(w1) == 1 and w1[0]["document"] == "옛 메모리" and w1[0]["fh"] == "legacyhash0000")
             await tool(s, "set_cutover", workspace=ws, machine="CS-15S-EQ3", mode="db", approval_quote="모두 db")
