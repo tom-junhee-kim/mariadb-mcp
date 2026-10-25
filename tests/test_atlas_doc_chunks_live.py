@@ -10,6 +10,7 @@ import os
 import secrets
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import doc_chunker  # noqa: E402
@@ -54,6 +55,11 @@ async def rows(s, like):
     return await sql(s, "SELECT id, origin_key, chunk_no, chunk_count, document, machine, project, "
                         "JSON_VALUE(metadata,'$.file_hash') fh, JSON_VALUE(metadata,'$.doc_id') doc_id, JSON_VALUE(metadata,'$.section_title') st "
                         "FROM chunks_test WHERE source=%s AND origin_key LIKE %s ORDER BY origin_key, chunk_no", [like[0], like[1]])
+
+
+def owned():
+    with urllib.request.urlopen(BASE + "/atlas/owned", timeout=15) as r:
+        return json.loads(r.read())
 
 
 async def wait_for(fn, what):
@@ -105,6 +111,7 @@ async def main():
             n_after = (await sql(s, done_sql))[0]["n"]
             check("전환 표지 없음 → 옛 조각 그대로(행 id·본문 같음)", before == after and len(after) == 3, f"{len(before)}→{len(after)}")
             check("전환 표지 없음 → 파일 종류 문서를 하나도 맞추지 않음(대기 중인 다른 문서 포함)", n_before == n_after, f"{n_before}→{n_after}")
+            check("/atlas/owned: 전환 표지 없으면 이 문서 키가 없음", lk not in owned()["machine_doc_prefixes"])
             cv = await sql(s, "SELECT version, chunk_version FROM docs_test WHERE doc_id=%s", [doc_id])
             check("전환 표지 없음 → chunk_version 도 그대로(판과 다름)", cv and cv[0]["chunk_version"] != cv[0]["version"], str(cv))
 
@@ -125,6 +132,7 @@ async def main():
                 check("머신 칸 = 호스트, 프로젝트 = machine, doc_id 기록", all(x["machine"] == host and x["project"] == "machine" and x["doc_id"] == doc_id for x in got))
             cv = await sql(s, "SELECT version, chunk_version FROM docs_test WHERE doc_id=%s", [doc_id])
             check("chunk_version = version", bool(cv) and cv[0]["chunk_version"] == cv[0]["version"], str(cv))
+            check("/atlas/owned: 전환한 머신 문서의 키가 들어 있음", lk in owned()["machine_doc_prefixes"], str(len(owned()["machine_doc_prefixes"])))
 
             # 3) 다시 맞춰도 변하지 않음, 절이 줄면 남는 키를 지움
             ids1 = {(x["origin_key"], x["chunk_no"]): x["id"] for x in (got or [])}
@@ -159,6 +167,7 @@ async def main():
                 return g if g and len(g) == 1 and g[0]["origin_key"].startswith(host) and g[0]["fh"] in (None, "") else None
             g_after = await wait_for(only_one, "전역 한 벌")
             check("전역 전환 → 다른 머신 사본 삭제·한 벌은 서버 조각(machine=global)", bool(g_after) and g_after[0]["machine"] == "global", str(g_after and g_after[0]["origin_key"]))
+            check("/atlas/owned: 전역 문서는 모든 머신 접두사로 펼침", all(f"{h}:{gname}.md" in owned()["machine_doc_prefixes"] for h in (host, other, 'ISD-TUF-GAMING', 'CS-15S-EQ3')))
 
             # 5) 퇴역 → 조각 삭제
             rp = await tool(s, "put_doc", kind="machine_doc", scope=f"machine:{host}", name=name, body="x", base_version=2, reason="퇴역", retire=True)
@@ -188,6 +197,7 @@ async def main():
             w2 = await wait_for(mem_done, "워크스페이스 메모리 전환")
             check("모든 머신 db → 서버가 만든 메모리 조각(키 유지·project = 키의 폴더 이름)",
                   bool(w2) and w2[0]["origin_key"] == wkey and w2[0]["project"] == f"{ws}-claude-workspace", str(w2 and w2[0]["project"]))
+            check("/atlas/owned: 워크스페이스 메모리는 프로젝트 이름으로", f"{ws}-claude-workspace" in owned()["workspace_projects"])
 
             # 7) 정리 — 시험 표의 시험 행
             await sql(s, "DELETE FROM chunk_idents_test WHERE origin_key LIKE %s OR origin_key LIKE %s OR origin_key LIKE %s", [f"%{TAG}%", f"%{TAG}%", f"%{TAG}%"])

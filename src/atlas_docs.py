@@ -3,7 +3,7 @@
 # 표(sql/atlas_docs.sql): docs · docs_history · doc_proposals · rule_events · tuning · ws_cutover · standing_approvals
 # 세션 도구 : list_docs · get_doc · put_doc · move_doc · diff_rules · rule_stats · add_standing_approval · set_cutover · decide_proposal
 # 파이프라인 도구(세션에서는 managed deny 로 숨김): import_docs · add_rule_events · set_rule_reactions · set_tuning · open_proposal
-# 훅 전용 HTTP 경로: GET /atlas/version · GET /atlas/rules · POST /atlas/search
+# HTTP 경로: GET /atlas/version · /atlas/rules · /atlas/docs · /atlas/owned(업로더용) · POST /atlas/search
 #
 # 규칙(rule)·CLAUDE.md 절(guide)은 언제나 후보(doc_proposals)를 거쳐 사람 승인 뒤에만 바뀐다. 사람 턴 대조는 클라이언트(gate)가 하고,
 # 서버는 판 충돌(base_version)·시험 해시(test_sha)·상시 승인 범위를 기계로 확인한다.
@@ -823,6 +823,34 @@ async def http_docs(server, kinds: List[str], scopes: List[str], nonce: str) -> 
     return {"echo": nonce, "etag": etag, "count": len(docs), "docs": docs}
 
 
+async def http_owned(server) -> Dict[str, Any]:
+    """서버가 검색 조각을 만드는 파일 종류 범위 — 파일 업로더가 이 키·프로젝트의 파일을 올리지 않게 알려 준다.
+    전역 머신 문서는 한 벌이라 모든 머신 접두사로 펼친다. 퇴역한 문서도 포함한다(파일이 남아 있어도 다시 올리지 않게)."""
+    async with _tx(server) as cur:
+        owned = await owned_file_scopes(cur)
+        prefixes: List[str] = []
+        projects: List[str] = []
+        if owned["machine_doc"]:
+            ph = ",".join(["%s"] * len(owned["machine_doc"]))
+            await cur.execute(f"SELECT scope, JSON_VALUE(header,'$.legacy_origin_key') AS lk FROM {Q_DOCS} WHERE kind='machine_doc' AND scope IN ({ph})",
+                              tuple(owned["machine_doc"]))
+            for r in await cur.fetchall():
+                lk = r["lk"]
+                if not lk:
+                    continue
+                if r["scope"] == "global" and ":" in lk:
+                    fname = lk.partition(":")[2]
+                    prefixes += [f"{h}:{fname}" for h in MACHINES]
+                else:
+                    prefixes.append(lk)
+        if owned["workspace_memory"]:
+            ph = ",".join(["%s"] * len(owned["workspace_memory"]))
+            await cur.execute(f"SELECT DISTINCT JSON_VALUE(header,'$.legacy_origin_key') AS lk FROM {Q_DOCS} WHERE kind='workspace_memory' AND scope IN ({ph})",
+                              tuple(owned["workspace_memory"]))
+            projects = sorted({r["lk"].split("/")[0] for r in await cur.fetchall() if r["lk"] and "/" in r["lk"]})
+    return {"machine_doc_prefixes": sorted(set(prefixes)), "workspace_projects": projects}
+
+
 def register_docs(server, embedding_service) -> None:
     global STATE, EMB
     mcp = server.mcp
@@ -873,6 +901,14 @@ def register_docs(server, embedding_service) -> None:
             return JSONResponse({"error": str(e)[:200]}, status_code=400)
         except Exception as e:  # noqa: BLE001
             logger.error(f"atlas docs: /atlas/docs 실패: {e}")
+            return JSONResponse({"error": str(e)[:200]}, status_code=503)
+
+    @mcp.custom_route("/atlas/owned", methods=["GET"])
+    async def atlas_owned(request: Request):
+        try:
+            return JSONResponse(await http_owned(server))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"atlas docs: /atlas/owned 실패: {e}")
             return JSONResponse({"error": str(e)[:200]}, status_code=503)
 
     @mcp.custom_route("/atlas/search", methods=["POST"])
