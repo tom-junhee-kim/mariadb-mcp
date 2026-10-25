@@ -20,11 +20,15 @@ import asyncmy
 
 from config import logger
 import atlas
+import doc_chunker
 from atlas import ATLAS_DB, ATLAS_INSTANCE, _SUFFIX
 
 KINDS = ("rule", "guide", "machine_doc", "workspace_memory")
 APPROVAL_KINDS = ("rule", "guide")          # 늘 후보로만 바뀌는 종류
-CHUNK_KINDS = ("rule", "guide")             # 이 모듈이 검색 조각을 만드는 종류(머신 문서·메모리는 2-1 전까지 파이프라인이 파일에서 만든다)
+CHUNK_KINDS = ("rule", "guide")             # 언제나 이 모듈이 검색 조각을 만드는 종류
+FILE_KINDS = ("machine_doc", "workspace_memory")   # 파일 업로더가 조각을 만들다가, 전환 표지(ws_cutover)가 db 가 되면 이 모듈이 만든다
+MACHINE_DOC_CUT = "@machine_doc"            # ws_cutover 에서 머신 문서 전환을 가리키는 가짜 워크스페이스 이름(machine 칸: 호스트 또는 'global')
+MACHINES = ("isD-MacBookPro", "JYGFRESH-JHCHEONG", "ISD-TUF-GAMING", "CS-15S-EQ3")   # 옛 머신 문서 조각 키의 접두사
 CHUNK_MAX = 800
 CHUNKER_VERSION = "d1"
 SYNC_SEC = float(os.getenv("ATLAS_DOCS_SYNC_SEC", "300"))
@@ -249,19 +253,94 @@ def split_body(body: str, limit: int = CHUNK_MAX) -> List[str]:
     return parts or [body[:limit] or "(빈 문서)"]
 
 
+async def owned_file_scopes(cur) -> Dict[str, List[str]]:
+    """전환 표지가 db 인 파일 종류 문서의 범위 — 이 범위의 검색 조각은 서버가 만든다(파일 업로더는 이 범위를 멈춰야 한다).
+    워크스페이스 메모리: 그 워크스페이스의 모든 머신 행이 db 일 때만. 머신 문서: ('@machine_doc', 호스트|'global') 행이 db 인 범위."""
+    await cur.execute(f"SELECT workspace, machine, mode FROM {Q_CUT}")
+    by_ws: Dict[str, List[Tuple[str, str]]] = {}
+    for r in await cur.fetchall():
+        by_ws.setdefault(r["workspace"], []).append((r["machine"], r["mode"]))
+    out: Dict[str, List[str]] = {"machine_doc": [], "workspace_memory": []}
+    for ws, items in by_ws.items():
+        if ws == MACHINE_DOC_CUT:
+            out["machine_doc"] += ["global" if m == "global" else f"machine:{m}" for m, mode in items if mode == "db"]
+        elif items and all(mode == "db" for _, mode in items):
+            out["workspace_memory"].append(f"ws:{ws}")
+    return out
+
+
+def _like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _purge_keys(server, source: str, prefix: str, keep: Tuple[str, ...] = ()) -> int:
+    """`prefix` 또는 `prefix#…` 키의 조각·식별자 중 keep 에 없는 것을 지운다(절이 줄었을 때·옛 사본·퇴역)."""
+    async with _tx(server) as cur:
+        await cur.execute(f"SELECT DISTINCT origin_key FROM {atlas.Q_CHUNKS} WHERE source=%s AND (origin_key=%s OR origin_key LIKE %s)",
+                          (source, prefix, _like_escape(prefix) + "#%"))
+        stale = [r["origin_key"] for r in await cur.fetchall() if r["origin_key"] not in keep]
+        for k in stale:
+            await cur.execute(f"DELETE FROM {atlas.Q_IDENTS} WHERE source=%s AND origin_key=%s", (source, k))
+            await cur.execute(f"DELETE FROM {atlas.Q_CHUNKS} WHERE source=%s AND origin_key=%s", (source, k))
+    return len(stale)
+
+
+def file_doc_groups(r: Dict[str, Any]) -> Tuple[str, List[Tuple[str, List[dict]]]]:
+    """머신 문서·워크스페이스 메모리 한 판을 [(origin_key, 조각)] 으로. 키는 옛 파일 업로더의 키(header.legacy_origin_key)를 그대로 쓴다 —
+    shown·opened 이력과 식별자가 끊기지 않게. 새 문서는 doc_id 가 키다."""
+    header = _json(r["header"]) if not isinstance(r["header"], dict) else r["header"]
+    header = header if isinstance(header, dict) else {}
+    lk = header.get("legacy_origin_key") or ""
+    prefix = lk or r["doc_id"]
+    scope, kind = r["scope"], r["kind"]
+    machine = "global" if scope == "global" else scope[len("machine:"):][:32] if scope.startswith("machine:") else scope[:32]
+    project = "machine" if kind == "machine_doc" else (lk.split("/")[0] if "/" in lk else scope[len("ws:"):])
+    base = {"machine": machine, "project": project, "item_at": int(r["at_ms"]), "doc_id": r["doc_id"], "doc_version": int(r["version"]),
+            "doc_title": r["name"]}
+    return prefix, doc_chunker.doc_groups(kind, prefix, r["body"] or "", base)
+
+
+async def _sync_file_doc(server, emb, r: Dict[str, Any]) -> None:
+    kind = r["kind"]
+    if r["status"] == "retired":
+        prefix = (_json(r["header"]) or {}).get("legacy_origin_key") or r["doc_id"]
+        await _purge_keys(server, kind, prefix)
+        return
+    prefix, groups = file_doc_groups(r)
+    for key, chunks in groups:
+        for k in range(0, len(chunks), atlas.MAX_CHUNKS_PER_CALL):
+            res = await atlas.do_add(server, emb, kind, key, chunks[k:k + atlas.MAX_CHUNKS_PER_CALL])
+            bad = [x for x in res["results"] if x["status"] == "error"]
+            if bad:
+                raise RuntimeError(f"{r['doc_id']}: {bad[0].get('error')}")
+    await _purge_keys(server, kind, prefix, tuple(k for k, _ in groups))
+    if kind == "machine_doc" and r["scope"] == "global" and ":" in prefix:
+        own, _, fname = prefix.partition(":")
+        for host in MACHINES:   # 전역 문서는 한 벌 — 머신마다 올리던 사본을 지운다
+            if host != own:
+                await _purge_keys(server, kind, f"{host}:{fname}")
+
+
 async def sync_chunks(server, emb, limit: int = 50) -> Dict[str, int]:
     if emb is None:
         return {"synced": 0}
     async with _tx(server) as cur:
+        owned = await owned_file_scopes(cur)
+        conds, params = [f"kind IN ({','.join(['%s'] * len(CHUNK_KINDS))})"], list(CHUNK_KINDS)
+        for fk, scopes in owned.items():
+            if scopes:
+                conds.append(f"(kind=%s AND scope IN ({','.join(['%s'] * len(scopes))}))")
+                params += [fk] + scopes
         await cur.execute(f"SELECT doc_id, kind, scope, name, status, header, body, version, "
                           f"TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', updated_at) DIV 1000 AS at_ms FROM {Q_DOCS} "
-                          f"WHERE kind IN ({','.join(['%s'] * len(CHUNK_KINDS))}) AND chunk_version <> version LIMIT %s",
-                          tuple(CHUNK_KINDS) + (int(limit),))
+                          f"WHERE ({' OR '.join(conds)}) AND chunk_version <> version LIMIT %s", tuple(params) + (int(limit),))
         rows = await cur.fetchall()
     done = 0
     for r in rows:
         did, kind = r["doc_id"], r["kind"]
-        if r["status"] == "retired":
+        if kind in FILE_KINDS:
+            await _sync_file_doc(server, emb, r)
+        elif r["status"] == "retired":
             async with _tx(server) as cur:
                 await cur.execute(f"DELETE FROM {atlas.Q_IDENTS} WHERE source=%s AND origin_key=%s", (kind, did))
                 await cur.execute(f"DELETE FROM {atlas.Q_CHUNKS} WHERE source=%s AND origin_key=%s", (kind, did))
@@ -517,6 +596,12 @@ async def do_set_cutover(server, workspace: str, machine: str, mode: str, approv
         await cur.execute(f"INSERT INTO {Q_CUT} (workspace, machine, mode, switched_at, switched_by) VALUES (%s,%s,%s,UTC_TIMESTAMP(3),%s) "
                           f"ON DUPLICATE KEY UPDATE mode=VALUES(mode), switched_at=VALUES(switched_at), switched_by=VALUES(switched_by)",
                           (workspace, machine, mode, by))
+        if mode == "db":   # 서버가 조각을 만들 범위가 되었으므로 그 문서들을 다음 맞춤 주기의 대상으로 만든다
+            if workspace == MACHINE_DOC_CUT:
+                await cur.execute(f"UPDATE {Q_DOCS} SET chunk_version = 0 WHERE kind = 'machine_doc' AND scope = %s",
+                                  ("global" if machine == "global" else f"machine:{machine}",))
+            else:
+                await cur.execute(f"UPDATE {Q_DOCS} SET chunk_version = 0 WHERE kind = 'workspace_memory' AND scope = %s", (f"ws:{workspace}",))
         rv = await _bump(cur, "rules_version")
     _state_touch(rules=rv)
     return {"status": "set", "workspace": workspace, "machine": machine, "mode": mode, "rules_version": rv}
