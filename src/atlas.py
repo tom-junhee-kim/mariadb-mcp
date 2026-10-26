@@ -477,7 +477,10 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                 await _log_events(cur, [{"event": "shown", "source": c["source"], "origin_key": c["origin_key"], "chunk_no": c["chunk_no"],
                                          "machine": machine, "project": project, "session_id": session_id, "session_name": session_name,
                                          "prompt_sha1": qsha, "distance": c["distance"], "rank_no": c["rank"]} for c in out if c["shown"]])
-    return {"results": out, "meta": {"total_ms": int((time.time() - t0) * 1000), "embed_ms": embed_ms,
+    total_ms = int((time.time() - t0) * 1000)
+    # 단계별 소요 한 줄 — 질의 원문은 남기지 않는다(db_ms = 전체 − 임베딩: 후보 조회·정렬·이벤트 기록)
+    logger.info(f"atlas.search embed_ms={embed_ms} db_ms={total_ms - embed_ms} total_ms={total_ms} sources={len(srcs)} results={len(out)}")
+    return {"results": out, "meta": {"total_ms": total_ms, "embed_ms": embed_ms,
                                       "per_source_fetched": per_src_count, "idents": [t for t, _ in idents],
                                       "exact_memory": mem_rows is not None, "mem_rows": (MEM.n if MEM is not None else 0),
                                       "ident_rules_sha": IDENT_RULES_SHA}}
