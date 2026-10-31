@@ -335,7 +335,7 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                        machine: Optional[str] = None, project: Optional[str] = None, session_id: Optional[str] = None,
                        session_name: Optional[str] = None, log_shown: bool = True,
                        instance_name: Optional[str] = None, rank: str = "distance",
-                       max_distance: Optional[float] = None) -> Dict[str, Any]:
+                       max_distance: Optional[float] = None, skip_log_keys: Optional[List[str]] = None) -> Dict[str, Any]:
     if not query or not isinstance(query, str):
         raise ValueError("query must be a non-empty string")
     if rank not in ("distance", "c4"):
@@ -473,10 +473,13 @@ async def do_search(server, emb, query: str, sources: Optional[List[str]] = None
                 c.pop("_id", None)
             # 5) 보여 준 조각을 events 에 기록
             if log_shown and top_n:
+                # 호출 쪽이 이미 보여 줘서 이번에 싣지 않은 조각(`<종류>:<origin_key>#<조각>`)은 shown 으로 세지 않는다
+                skip = set(skip_log_keys or ())
                 qsha = hashlib.sha1(query.encode("utf-8")).hexdigest()
                 await _log_events(cur, [{"event": "shown", "source": c["source"], "origin_key": c["origin_key"], "chunk_no": c["chunk_no"],
                                          "machine": machine, "project": project, "session_id": session_id, "session_name": session_name,
-                                         "prompt_sha1": qsha, "distance": c["distance"], "rank_no": c["rank"]} for c in out if c["shown"]])
+                                         "prompt_sha1": qsha, "distance": c["distance"], "rank_no": c["rank"]} for c in out
+                                         if c["shown"] and f'{c["source"]}:{c["origin_key"]}#{c["chunk_no"]}' not in skip])
     total_ms = int((time.time() - t0) * 1000)
     # 단계별 소요 한 줄 — 질의 원문은 남기지 않는다(db_ms = 전체 − 임베딩: 후보 조회·정렬·이벤트 기록)
     logger.info(f"atlas.search embed_ms={embed_ms} db_ms={total_ms - embed_ms} total_ms={total_ms} sources={len(srcs)} results={len(out)}")
@@ -504,11 +507,11 @@ def register_atlas_tools(server, embedding_service) -> None:
                                 project: Optional[str] = None, session_id: Optional[str] = None,
                                 session_name: Optional[str] = None, log_shown: bool = True,
                                 instance_name: Optional[str] = None, rank: str = "distance",
-                                max_distance: Optional[float] = None) -> Dict[str, Any]:
-        """Search the memory atlas (transcripts, auto-memory, workspace memory, machine docs) by meaning plus exact identifiers (commit hash, path, board no). rank='c4' adds recency for transcripts; max_distance limits which of the top_n are marked shown."""
+                                max_distance: Optional[float] = None, skip_log_keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Search the memory atlas (transcripts, auto-memory, workspace memory, machine docs) by meaning plus exact identifiers (commit hash, path, board no). rank='c4' adds recency for transcripts; max_distance limits which of the top_n are marked shown. skip_log_keys (`<source>:<origin_key>#<chunk_no>`) lists chunks the caller did not actually show, so they are not logged as shown."""
         return await do_search(server, embedding_service, query, sources, per_source_n, return_n, top_n, before,
                                   exclude_session_id, exclude_after_line, machine, project, session_id, session_name,
-                                  log_shown, instance_name, rank, max_distance)
+                                  log_shown, instance_name, rank, max_distance, skip_log_keys)
 
     @mcp.tool
     async def get_atlas(source: str, origin_key: str, chunk_no: Optional[int] = None, record_open: bool = True,

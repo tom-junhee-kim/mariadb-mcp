@@ -925,7 +925,7 @@ def register_docs(server, embedding_service) -> None:
                                         int(a.get("return_n", 10)), int(a.get("top_n", 3)), a.get("before"), a.get("exclude_session_id"),
                                         a.get("exclude_after_line"), a.get("machine"), a.get("project"), a.get("session_id"),
                                         a.get("session_name"), bool(a.get("log_shown", True)), None, a.get("rank", "distance"),
-                                        a.get("max_distance"))
+                                        a.get("max_distance"), a.get("skip_log_keys"))
             return JSONResponse(res)
         except Exception as e:  # noqa: BLE001
             return JSONResponse({"error": str(e)[:200]}, status_code=503)
