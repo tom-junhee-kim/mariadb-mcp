@@ -108,10 +108,13 @@ async def main():
                 await search(s, sids[3], log_shown=False, skip_log_keys=[first])
                 check("대조군: log_shown=false 면 기록 0줄", await logged(s, sids[3]) == set())
             finally:
-                await sql(s, "DELETE FROM events_test WHERE session_id IN (%s,%s,%s,%s)", sids)
-                await sql(s, "DELETE FROM chunks_test WHERE source='machine_doc' AND origin_key LIKE %s", [f"{HOST}:zz{TAG}-%"])
-                left_e = await sql(s, "SELECT COUNT(*) n FROM events_test WHERE session_id IN (%s,%s,%s,%s)", sids)
-                left_c = await sql(s, "SELECT COUNT(*) n FROM chunks_test WHERE origin_key LIKE %s", [f"{HOST}:zz{TAG}-%"])
+                # 앞선 시험이 남긴 조각까지 같은 꼴(zz<태그>-n.md)이면 함께 지운다 — 시험 표만 대상, 커밋해야 남지 않는다
+                pat = f"{HOST}:zz%-%.md#0"
+                await sql(s, "DELETE FROM events_test WHERE ref_source='machine_doc' AND ref_origin_key LIKE %s", [pat])
+                await sql(s, "DELETE FROM chunks_test WHERE source='machine_doc' AND origin_key LIKE %s", [pat])
+                await sql(s, "COMMIT")
+                left_e = await sql(s, "SELECT COUNT(*) n FROM events_test WHERE ref_origin_key LIKE %s", [pat])
+                left_c = await sql(s, "SELECT COUNT(*) n FROM chunks_test WHERE origin_key LIKE %s", [pat])
                 check("정리: 시험 표에 남은 이벤트·조각 0", left_e[0]["n"] == 0 and left_c[0]["n"] == 0, f"{left_e} {left_c}")
     print(f"결과: {'통과' if all(RESULTS) else '실패 ' + str(RESULTS.count(False)) + '건'}")
     return 0 if all(RESULTS) else 1
