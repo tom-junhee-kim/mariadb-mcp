@@ -36,7 +36,8 @@ class TestQueryValidation(unittest.TestCase):
         acquire_cm.__aexit__ = AsyncMock(return_value=None)
         pool = MagicMock()
         pool.acquire = MagicMock(return_value=acquire_cm)
-        self.server.pool = pool
+        self.server.pools['default'] = pool
+        self.server.default_instance = 'default'
 
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -414,10 +415,11 @@ class TestClientCapabilityAndPrivilegeWarnings(unittest.IsolatedAsyncioTestCase)
 
         pool = MagicMock()
         pool.acquire = MagicMock(return_value=acquire_cm)
-        server.pool = pool
+        server.pools['default'] = pool
+        server.default_instance = 'default'
 
         with patch("server.logger") as mock_logger:
-            await server._warn_if_file_privilege_enabled()
+            await server._warn_if_file_privilege_enabled(pool, 'default')
             self.assertTrue(mock_logger.error.called)
 
     async def test_does_not_warn_when_not_read_only(self):
@@ -426,7 +428,7 @@ class TestClientCapabilityAndPrivilegeWarnings(unittest.IsolatedAsyncioTestCase)
 
         with patch("server.logger") as mock_logger:
             if server.is_read_only:
-                await server._warn_if_file_privilege_enabled()
+                await server._warn_if_file_privilege_enabled(pool, 'default')
             self.assertFalse(mock_logger.error.called)
 
 

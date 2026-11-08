@@ -71,7 +71,7 @@ class MariaDBServer:
         # name -> (reason, monotonic time of last attempt, permanent)
         self.failed_instances: Dict[str, tuple] = {}
         self._pool_locks: Dict[str, asyncio.Lock] = {}
-        self.autocommit = not MCP_READ_ONLY
+        self.autocommit = autocommit
         self.is_read_only = MCP_READ_ONLY
         self.block_sensitive_show = MCP_BLOCK_SENSITIVE_SHOW
         logger.info(f"Initializing {server_name}...")
