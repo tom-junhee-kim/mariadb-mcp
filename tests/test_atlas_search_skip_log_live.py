@@ -6,6 +6,7 @@
   - 양성 기본: skip_log_keys 없이 부르면 shown 인 조각 전부가 기록된다(회귀)
   - 양성 skip: 목록에 든 조각만 빠지고 나머지는 기록된다
   - 대조군: 목록에 없는 키는 아무것도 빼지 않는다 · log_shown=false 면 한 줄도 없다
+  - 세션 ID 없이 도구로 부르면 shown 이 한 줄도 남지 않는다(양성) · 세션 ID 를 주면 그대로 남는다(대조)
 시험이 심은 조각·이벤트는 끝에 지운다(시험 표만).
 """
 import asyncio
@@ -58,14 +59,22 @@ def key(c):
 
 async def search(s, sid, **extra):
     q = f"zz{TAG} 건너뛰기 기록 시험 문서 본문"
-    d = await tool(s, "search_atlas", query=q, sources=["machine_doc"], top_n=3, per_source_n=15, return_n=10,
-                   machine=HOST, session_id=sid, **extra)
+    args = dict(query=q, sources=["machine_doc"], top_n=3, per_source_n=15, return_n=10, machine=HOST)
+    if sid is not None:
+        args["session_id"] = sid
+    d = await tool(s, "search_atlas", **args, **extra)
     return d.get("results", d.get("result", {}).get("results", [])) if isinstance(d, dict) else []
 
 
 async def logged(s, sid):
     rows = await sql(s, "SELECT ref_source, ref_origin_key, ref_chunk_no FROM events_test WHERE session_id=%s AND event='shown'", [sid])
     return {f"{r['ref_source']}:{r['ref_origin_key']}#{r['ref_chunk_no']}" for r in rows}
+
+
+async def logged_by_prompt(s, prompt_sha1):
+    """세션 ID 없이 부른 호출은 session_id 로 못 찾으니 같은 질의의 해시로 센다."""
+    rows = await sql(s, "SELECT ref_origin_key FROM events_test WHERE event='shown' AND prompt_sha1=%s", [prompt_sha1])
+    return {r["ref_origin_key"] for r in rows}
 
 
 async def main():
@@ -107,6 +116,19 @@ async def main():
                 # 4) 대조군 — log_shown false
                 await search(s, sids[3], log_shown=False, skip_log_keys=[first])
                 check("대조군: log_shown=false 면 기록 0줄", await logged(s, sids[3]) == set())
+
+                # 5) 세션 ID 없는 도구 호출 — 기록 0줄(질의 해시로 센다). 같은 질의를 세션 ID 와 함께 부르면 기록이 남는다(대조)
+                import hashlib
+                qsha = hashlib.sha1(f"zz{TAG} 건너뛰기 기록 시험 문서 본문".encode("utf-8")).hexdigest()
+                before = await logged_by_prompt(s, qsha)
+                res5 = await search(s, None)
+                shown5 = {key(c) for c in res5 if c["shown"]}
+                check("세션 ID 없음: 검색 결과·shown 플래그는 그대로", shown5 == shown, str(sorted(shown5))[:120])
+                after = await logged_by_prompt(s, qsha)
+                check("세션 ID 없음: 이번 호출로 shown 기록이 늘지 않음", after == before, f"전 {len(before)} 후 {len(after)}")
+                sid6 = str(uuid.uuid4())
+                await search(s, sid6)
+                check("대조: 세션 ID 를 주면 같은 질의의 shown 이 그 세션으로 기록됨(위 0과 대비)", await logged(s, sid6) == shown, f"{len(await logged(s, sid6))}건")
             finally:
                 # 앞선 시험이 남긴 조각까지 같은 꼴(zz<태그>-n.md)이면 함께 지운다 — 시험 표만 대상, 커밋해야 남지 않는다
                 pat = f"{HOST}:zz%-%.md#0"
