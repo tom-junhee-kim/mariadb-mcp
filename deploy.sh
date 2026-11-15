@@ -8,7 +8,10 @@
 #   크래시 루프면 자동으로 되돌린다. -old 는 다음 배포에서 빌드가 성공한 뒤 로그를 백업하고 지운다.
 # - 사용법: ./deploy.sh
 #   MCP_DEPLOY_TARGET=test 이면 시험 대상(~/mariadb-mcp-test, 컨테이너 mariadb-mcp-test, 호스트 포트 19001,
-#   이미지 codescent/mariadb-mcp:test)에 배포한다. 대상은 이 두 묶음만 허용한다.
+#   이미지 codescent/mariadb-mcp:test)에 배포한다.
+#   MCP_DEPLOY_TARGET=http 이면 운영 streamable-http 컨테이너(mariadb-mcp-http, 호스트 포트 9002, ~/mariadb-mcp 의
+#   .env·instances.json 공유, 이미지 codescent/mariadb-mcp:latest)에 배포한다 — 명령 인자와 stateless 환경값을 run.sh 에 싣는다.
+#   대상은 이 세 묶음만 허용한다.
 #
 # 정적분석 억제 사유(아래 disable 지시):
 # - SC2029: ssh에 넘기는 명령 문자열 안의 변수는 로컬에서 확장되는 것이 의도다.
@@ -24,8 +27,15 @@ TARGET="${MCP_DEPLOY_TARGET:-prod}"
 case "$TARGET" in
   prod) NAME="mariadb-mcp"; PORT="9001"; REMOTE_DIR="~/mariadb-mcp"; IMAGE="codescent/mariadb-mcp:latest" ;;
   test) NAME="mariadb-mcp-test"; PORT="19001"; REMOTE_DIR="~/mariadb-mcp-test"; IMAGE="codescent/mariadb-mcp:test" ;;
-  *) echo "ERROR: MCP_DEPLOY_TARGET 은 prod 또는 test 만 허용한다: '$TARGET'" >&2; exit 1 ;;
+  http) NAME="mariadb-mcp-http"; PORT="9002"; REMOTE_DIR="~/mariadb-mcp"; IMAGE="codescent/mariadb-mcp:latest" ;;
+  *) echo "ERROR: MCP_DEPLOY_TARGET 은 prod·test·http 만 허용한다: '$TARGET'" >&2; exit 1 ;;
 esac
+# 대상별로 run.sh 에 더 싣는 것 — http 는 서버가 이미지 기본(SSE)과 다른 명령으로 돈다.
+RUN_ENV=""; RUN_CMD=""
+if [ "$TARGET" = "http" ]; then
+  RUN_ENV="MCP_EXTRA_ENV='ATLAS_DOCS_SYNC_SEC=86400 FASTMCP_STATELESS_HTTP=true'"
+  RUN_CMD="python src/server.py --host 0.0.0.0 --transport http --port 9001 --path /mcp"
+fi
 OLD="${NAME}-old"
 echo "==> 대상: $TARGET ($HOST:$REMOTE_DIR, $NAME, :$PORT, $IMAGE)"
 
@@ -55,7 +65,7 @@ ssh "$HOST" "mkdir -p $REMOTE_DIR/logs && chmod 755 $REMOTE_DIR/logs"
 
 # 2. 이미지 빌드 — 운영 배포를 git 작업 트리에서 할 때만 커밋 태그를 함께 붙인다(시험은 떠도는 태그를 남기지 않는다)
 TAGS="$IMAGE"
-if [ "$TARGET" = "prod" ] && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if { [ "$TARGET" = "prod" ] || [ "$TARGET" = "http" ]; } && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   SHA="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"
   if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain)" ]; then SHA="${SHA}-dirty"; fi
   TAGS="$TAGS codescent/mariadb-mcp:$SHA"
@@ -100,7 +110,7 @@ echo "==> 전환: $NAME -> $OLD, 새 컨테이너 기동"
 if ssh "$HOST" "docker inspect $NAME >/dev/null 2>&1"; then
   ssh "$HOST" "docker rename $NAME $OLD && docker stop -t 10 $OLD"
 fi
-if ! ssh "$HOST" "bash $REMOTE_DIR/run.sh $NAME $PORT $IMAGE"; then
+if ! ssh "$HOST" "$RUN_ENV bash $REMOTE_DIR/run.sh $NAME $PORT $IMAGE $RUN_CMD"; then
   echo "ERROR: 새 컨테이너를 띄우지 못했습니다. 롤백합니다." >&2
   rollback
 fi

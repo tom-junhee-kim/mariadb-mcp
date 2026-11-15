@@ -509,6 +509,10 @@ def register_atlas_tools(server, embedding_service) -> None:
                                 instance_name: Optional[str] = None, rank: str = "distance",
                                 max_distance: Optional[float] = None, skip_log_keys: Optional[List[str]] = None) -> Dict[str, Any]:
         """Search the memory atlas (transcripts, auto-memory, workspace memory, machine docs) by meaning plus exact identifiers (commit hash, path, board no). rank='c4' adds recency for transcripts; max_distance limits which of the top_n are marked shown. skip_log_keys (`<source>:<origin_key>#<chunk_no>`) lists chunks the caller did not actually show, so they are not logged as shown."""
+        # MCP 도구로 세션 ID 없이 부른 검색(어느 세션이 본 것인지 알 수 없음)은 shown 을 기록하지 않는다 — machine=unknown·session_id=""
+        # 로 쌓여 효과 집계를 흐린다. HTTP `/atlas/search` 는 이 감싸개를 거치지 않고 do_search 를 직접 부르므로 기록 규칙이 그대로다.
+        if not session_id:
+            log_shown = False
         return await do_search(server, embedding_service, query, sources, per_source_n, return_n, top_n, before,
                                   exclude_session_id, exclude_after_line, machine, project, session_id, session_name,
                                   log_shown, instance_name, rank, max_distance, skip_log_keys)
