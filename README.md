@@ -1,14 +1,13 @@
 # MariaDB MCP
 
-MariaDB MCP 서버. instances.json으로 멀티 인스턴스를 단일 컨테이너에서 관리한다.
+MariaDB MCP 서버. instances.json으로 멀티 인스턴스를 단일 프로세스에서 관리한다.
 
 ## 서버 정보
 
-- **배포 대상**: DM300S3B-B33 (192.168.2.14)
-- **이미지**: `codescent/mariadb-mcp:latest` + 커밋 태그 `codescent/mariadb-mcp:<sha>` (커스텀 — python:3.11.15-slim + uv 0.11.31, 의존성은 `uv.lock` 고정)
-- **컨테이너**: `mariadb-mcp`
-- **네트워크**: bridge (9001)
-- **재시작 정책**: on-failure — 부팅 때 순서는 서버의 boot-order 서비스가 띄운다(codescent-claude-workspace `.claude/toolkit/boot-order`)
+- **배포 대상**: k3s 파드(DM300S3B-B33 노드 고정). 운영은 streamable-http(호스트 9002, 경로 `/mcp`), 시험은 SSE(호스트 19001, 평소 replicas 0)
+- **이미지**: `mariadb-mcp:sha-<커밋 7자>` 를 서버 registry 에 올리고 매니페스트에 digest 까지 고정한다(커스텀 — python:3.11.15-slim + uv 0.11.31, 의존성은 `uv.lock` 고정)
+- **환경값**: `.env` 값과 `instances.json` 은 SOPS Secret 이 정본이다(저장소·서버 파일이 아니다)
+- **Docker 컨테이너는 쓰지 않는다**: 부팅 때 서버의 boot-order 서비스도 띄우지 않는다. `run.sh` 는 되돌림 전용(가드)이다
 
 ## 파일 구조
 
@@ -31,12 +30,13 @@ mariadb-mcp/
 └── uv.lock                     # 의존성 잠금 — 재빌드가 같은 판을 설치한다
 ```
 
-## 볼륨 마운트
+## 파드 마운트
 
-| 컨테이너 경로 | 호스트 경로 | 모드 | 용도 |
+| 컨테이너 경로 | 출처 | 모드 | 용도 |
 |---|---|---|---|
-| `/app/instances.json` | `~/mariadb-mcp/instances.json` | ro | 멀티 인스턴스 설정 |
-| `/app/logs` | `~/mariadb-mcp/logs` | rw | 서버 로그 |
+| `/app/instances.json` | Secret | ro | 멀티 인스턴스 설정 |
+| `/app/logs` | emptyDir | rw | 서버 로그 |
+| `/tmp` | emptyDir | rw | 임시 |
 
 ## 환경 변수
 
@@ -50,26 +50,20 @@ mariadb-mcp/
 - `EMBEDDING_PROVIDER` — 임베딩 프로바이더 (openai, gemini, huggingface)
 - `LOG_LEVEL` / `LOG_FILE` — 로깅 설정
 
-## 배포
+## 배포 (k3s)
 
 ```bash
-# macOS/Linux
-./deploy.sh
-
-# Windows
-.\deploy.ps1
+# macOS/Linux — 시험 대상(기본)
+bash ./deploy.sh
+# 시험을 통과한 뒤 운영
+MCP_DEPLOY_TARGET=http bash ./deploy.sh
 ```
 
-배포 흐름:
-1. 서버 `.env`·`instances.json` 확인 (없으면 중단)
-2. 소스 동기화 (rsync / scp) — 기존 컨테이너는 계속 서비스한다
-3. 서버에서 이미지 빌드 — 실패하면 여기서 중단하고 운영은 그대로다
-4. 이전 세대 `mariadb-mcp-old` 가 있으면 로그를 `logs/` 에 백업하고 제거
-5. 전환: 운영 컨테이너를 `mariadb-mcp-old` 로 바꿔 정지 → 새 컨테이너 기동 (순단은 여기서 healthy 까지)
-6. healthy 대기(최대 300초) — 실패하거나 크래시 루프면 `mariadb-mcp-old` 로 자동 롤백
+`deploy.sh` 의 흐름: 작업 트리가 깨끗한지 확인(태그 `sha-<커밋 7자>`) → registry 에 같은 태그가 있으면 건너뛰고, 없으면 DM300(amd64)에 소스 업로드·빌드·push → 이미지 digest 읽기 → gitops 이미지 줄을 `태그@digest` 로 커밋(Flux 가 반영) → Flux 반영·rollout 확인.
+내부 값(registry·namespace·Deployment 이름)은 저장소 밖 설정 파일(`MCP_DEPLOY_CONF`)에서 읽는다. `DRY_RUN=1` 은 서버·gitops 에 쓰지 않고 확인만 한다.
 
-`mariadb-mcp-old` 는 다음 배포까지 정지 상태로 남는다. 배포가 끝나면 되돌리는 명령을 출력한다.
-`MCP_DEPLOY_TARGET=test` 로 실행하면 시험 대상(`~/mariadb-mcp-test`, 컨테이너 `mariadb-mcp-test`, 호스트 포트 19001)에 배포한다.
+시험 절차: 시험 Deployment 는 평소 replicas 0 이라 `deploy.sh`(test)는 이미지만 바꾼다 → 배포 저장소에서 replicas 1 로 커밋 → `tests/test_atlas_docs_live.py` 를 19001 로 실행 → 통과하면 `MCP_DEPLOY_TARGET=http` → 시험을 replicas 0 으로 되돌리는 커밋.
+롤백은 배포 저장소에서 이전 태그로 되돌리는 커밋이다(`kubectl scale`·`set image` 는 Flux 가 되돌린다). 옛 Docker 배포(`deploy.ps1`·`run.sh`)는 `ALLOW_DOCKER_RUN=1` 일 때만 돈다.
 
 의존성 판을 올릴 때는 `pyproject.toml` 의 `[tool.uv] exclude-newer` 를 옮기고 `uv lock --upgrade` 로 `uv.lock` 을 갱신해 함께 커밋한다.
 
@@ -77,10 +71,10 @@ mariadb-mcp/
 
 ### 상태 확인
 ```bash
-ssh DM300S3B-B33 "docker ps --filter name=mariadb-mcp"
+kubectl -n <namespace> get pods -l app.kubernetes.io/name=mariadb-mcp-http
 ```
 
 ### 로그 확인
 ```bash
-ssh DM300S3B-B33 "docker logs mariadb-mcp"
+kubectl -n <namespace> logs deploy/mariadb-mcp-http
 ```

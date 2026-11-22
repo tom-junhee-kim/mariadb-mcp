@@ -10,6 +10,11 @@
 #   $env:MCP_DEPLOY_TARGET = 'test' 이면 시험 대상(~/mariadb-mcp-test, 컨테이너 mariadb-mcp-test, 호스트 포트 19001,
 #   이미지 codescent/mariadb-mcp:test)에 배포한다. 대상은 이 두 묶음만 허용한다.
 $ErrorActionPreference = "Stop"
+# 이 서비스는 k3s 로 이전했다 — 이 스크립트는 Docker 컨테이너를 만든다. 되돌림(파드 replicas 0 확인 뒤)에만 $env:ALLOW_DOCKER_RUN = "1" 로 실행한다.
+if ($env:ALLOW_DOCKER_RUN -ne "1") {
+    Write-Error "mariadb-mcp 는 k3s 로 이전했다 — 이 스크립트는 Docker 컨테이너를 만든다. 배포는 deploy.sh(macOS/Linux)로 한다."
+    exit 1
+}
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
