@@ -15,7 +15,7 @@ set -euo pipefail
 
 HOST="DM300S3B-B33"
 REMOTE_DIR="~/mariadb-mcp"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"   # -P: 워크스페이스 docker/ 심링크로 불러도 실체 경로(저장소 옆 폴더 기준)가 나온다
 TARGET="${MCP_DEPLOY_TARGET:-test}"
 DRY="${DRY_RUN:-0}"
 WS="${CS_WORKSPACE:-$(cd "$SCRIPT_DIR/.." && pwd)/codescent-claude-workspace}"
