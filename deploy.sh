@@ -6,7 +6,7 @@
 #     DRY_RUN=1 이면 서버·gitops 에 아무것도 쓰지 않고 가능한 데까지 확인만 한다(registry 에 태그가 있으면 digest 와 바뀔 줄까지 본다).
 # - 태그는 sha-<커밋 7자>. 작업 트리가 깨끗해야 하고(태그가 내용과 어긋나지 않게), http 는 커밋이 원격에 올라가 있어야 한다.
 #   registry 에 같은 태그가 이미 있으면 빌드·push 를 건너뛰고 그 이미지를 쓴다(태그 불변).
-# - 내부 값(registry·namespace·Deployment 이름)은 저장소 밖 설정 파일에서 읽는다: MCP_DEPLOY_CONF (기본 $CS_WORKSPACE/tools/gitops-image/mariadb-mcp.conf).
+# - 내부 값(registry·namespace·Deployment 이름)은 저장소 밖 설정 파일에서 읽는다: MCP_DEPLOY_CONF (기본 <이 저장소 옆 폴더>/codescent-claude-workspace/tools/gitops-image/mariadb-mcp.conf, CS_WORKSPACE 로 바꿀 수 있다).
 # - 필요: ssh DM300S3B-B33(registry 로그인 있음), $CS_WORKSPACE/tools/gitops-image/bump.sh, kubectl + kubeconfig(KUBECONFIG 또는 설정 파일의 KCFG_DEFAULT — 없으면 rollout 확인만 건너뜀)
 # - 롤백: 배포 저장소(gitops)에서 이전 태그로 되돌리는 커밋. kubectl scale·set image 는 Flux 가 되돌린다.
 # 정적분석 억제: SC2029 ssh 에 넘기는 문자열의 변수는 로컬에서 펼치는 것이 의도, SC2088 REMOTE_DIR 의 ~ 는 원격 셸·rsync 가 펼친다.
@@ -18,7 +18,7 @@ REMOTE_DIR="~/mariadb-mcp"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET="${MCP_DEPLOY_TARGET:-test}"
 DRY="${DRY_RUN:-0}"
-WS="${CS_WORKSPACE:-$HOME/Developer/codescent-claude-workspace}"
+WS="${CS_WORKSPACE:-$(cd "$SCRIPT_DIR/.." && pwd)/codescent-claude-workspace}"
 CONF="${MCP_DEPLOY_CONF:-$WS/tools/gitops-image/mariadb-mcp.conf}"
 BUMP="${GITOPS_BUMP:-$WS/tools/gitops-image/bump.sh}"
 
