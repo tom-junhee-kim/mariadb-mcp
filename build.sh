@@ -9,4 +9,6 @@ TAGS=("$@")
 if [ ${#TAGS[@]} -eq 0 ]; then TAGS=("codescent/mariadb-mcp:latest"); fi
 ARGS=()
 for t in "${TAGS[@]}"; do ARGS+=(-t "$t"); done
-docker build "${ARGS[@]}" "$DIR"
+# BUILD_NETWORK(선택): 빌드 컨테이너 네트워크(예 host). 서버의 Docker 기본 DNS 가 컨테이너에서 안 닿을 때의 임시 우회용 — 비우면 기본 동작
+NET=(); if [ -n "${BUILD_NETWORK:-}" ]; then NET=(--network "$BUILD_NETWORK"); fi
+docker build ${NET[@]+"${NET[@]}"} "${ARGS[@]}" "$DIR"

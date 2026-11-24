@@ -68,7 +68,7 @@ if [ "$IN_REGISTRY" = 0 ]; then
     --exclude='logs/' --exclude='src/tests/' --exclude='instances.json' \
     "$SCRIPT_DIR/" "$HOST:$REMOTE_DIR/"
   echo "==> 이미지 빌드 $IMAGE (실패하면 여기서 멈춘다 — 운영은 그대로)"
-  ssh "$HOST" "bash $REMOTE_DIR/build.sh $IMAGE" || { echo "ERROR: 이미지 빌드 실패 — 아무것도 반영하지 않았다." >&2; exit 1; }
+  ssh "$HOST" "BUILD_NETWORK='${BUILD_NETWORK:-}' bash $REMOTE_DIR/build.sh $IMAGE" || { echo "ERROR: 이미지 빌드 실패 — 아무것도 반영하지 않았다." >&2; exit 1; }
   echo "==> push $IMAGE (큰 새 레이어가 413 으로 거부되면 DM300 의 registry 우회 설정을 확인한다)"
   ssh "$HOST" "docker push -q $IMAGE" || { echo "ERROR: push 실패 — 아무것도 반영하지 않았다." >&2; exit 1; }
 else
