@@ -60,6 +60,11 @@ if _OPENAI_EMBEDDING_MODEL:
     ALLOWED_OPENAI_MODELS = ALLOWED_OPENAI_MODELS + [_OPENAI_EMBEDDING_MODEL]
     DEFAULT_OPENAI_MODEL = _OPENAI_EMBEDDING_MODEL
     OPENAI_MODEL_DIMENSIONS[_OPENAI_EMBEDDING_MODEL] = int(os.getenv("OPENAI_EMBEDDING_DIM", "1024"))
+# add_atlas(대량 적재) 전용 모델 이름. 비어 있으면 기본 모델을 쓴다. 같은 모델을 다른 서빙 경로(프록시 별칭)로 부르는 용도라 차원은 기본 모델과 같다.
+BULK_EMBED_MODEL: Optional[str] = (os.getenv("ATLAS_BULK_EMBED_MODEL") or "").strip() or None
+if BULK_EMBED_MODEL and BULK_EMBED_MODEL not in ALLOWED_OPENAI_MODELS:
+    ALLOWED_OPENAI_MODELS = ALLOWED_OPENAI_MODELS + [BULK_EMBED_MODEL]
+    OPENAI_MODEL_DIMENSIONS[BULK_EMBED_MODEL] = int(os.getenv("OPENAI_EMBEDDING_DIM", "1024"))
 # Gemini Embedding Models
 ALLOWED_GEMINI_MODELS: List[str] = ["text-embedding-004"]
 DEFAULT_GEMINI_MODEL: str = "text-embedding-004"

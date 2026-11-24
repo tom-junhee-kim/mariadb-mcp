@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncmy
 
 from config import logger
+from embeddings import BULK_EMBED_MODEL
 from atlas_mem import MemoryIndex
 
 ATLAS_DB = os.getenv("ATLAS_DB", "memory_atlas")
@@ -70,6 +71,7 @@ for _r in _RULES_DOC["rules"]:
     _flags = re.IGNORECASE if "i" in _r.get("flags", "") else 0
     _RULES.append((_r["type"], re.compile(_r["regex"], _flags)))
 logger.info(f"atlas ident rules loaded: version={IDENT_VERSION} sha256={IDENT_RULES_SHA}")
+logger.info(f"atlas add 임베딩 모델: {BULK_EMBED_MODEL or '(기본 모델)'}")
 
 
 def extract_idents(text: str) -> List[Tuple[str, str]]:
@@ -196,6 +198,17 @@ async def do_add(server, emb, source: str, origin_key: str, chunks: List[Dict[st
             "ident_version": IDENT_VERSION, "ident_rules_sha": IDENT_RULES_SHA}
 
 
+async def _embed_for_add(emb, text: str):
+    """add 경로 전용 임베딩. BULK_EMBED_MODEL 이 있으면 그 이름으로 부르고, 실패하면 기본 모델로 한 번 더 시도한다(적재가 멈추지 않는다). 검색·질의는 이 함수를 쓰지 않는다."""
+    if not BULK_EMBED_MODEL:
+        return await emb.embed(text)
+    try:
+        return await emb.embed(text, BULK_EMBED_MODEL)
+    except Exception as e:
+        logger.warning(f"atlas: bulk 임베딩 실패({BULK_EMBED_MODEL}) — 기본 모델로 재시도: {type(e).__name__}: {e}")
+        return await emb.embed(text)
+
+
 async def _add_one(cur, conn, emb, source: str, origin_key: str, ch: Dict[str, Any], only_if_newer: bool) -> Dict[str, Any]:
     document = ch.get("document")
     if not isinstance(document, str) or not document.strip():
@@ -236,7 +249,7 @@ async def _add_one(cur, conn, emb, source: str, origin_key: str, ch: Dict[str, A
         replacing = True
 
     # 2) 임베딩(트랜잭션 밖에서)
-    vec = await emb.embed(_embed_text(source, document, meta))
+    vec = await _embed_for_add(emb, _embed_text(source, document, meta))
     if len(vec) != 1024:
         raise RuntimeError(f"unexpected embedding dimension: {len(vec)}")
 

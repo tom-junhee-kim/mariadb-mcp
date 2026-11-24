@@ -30,6 +30,7 @@ esac
 # shellcheck source=/dev/null
 . "$CONF"
 : "${REG:?설정 파일에 REG 가 없다}" "${NS:?설정 파일에 NS 가 없다}"
+NS_VAR="NS_${TARGET}"; NS="${!NS_VAR:-$NS}"   # 대상마다 칸이 다르면 설정 파일의 NS_<대상> 이 NS 보다 앞선다
 DEPLOY_VAR="DEPLOY_${TARGET}"
 DEPLOY_NAME="${!DEPLOY_VAR:?설정 파일에 $DEPLOY_VAR 가 없다}"
 KCFG="${KUBECONFIG:-${KCFG_DEFAULT:-}}"
